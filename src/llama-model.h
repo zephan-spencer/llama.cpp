@@ -645,6 +645,7 @@ struct llama_model {
     const float * tensor_split() const;
 
     uint32_t n_gpu_layers() const;
+    uint32_t n_moe_cache_experts() const;
     llama_split_mode split_mode() const;
 
     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const;

@@ -106,6 +106,21 @@ static void test(void) {
     argv = {"binary_name", "-lm", "hello"};
     assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
 
+    argv = {"binary_name", "--moe-cache-experts", "-1"};
+    assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
+
+    common_params conflict_params;
+    argv = {"binary_name", "-m", "model_file.gguf", "--cpu-moe", "--moe-cache-experts", "64"};
+    assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), conflict_params, LLAMA_EXAMPLE_COMMON));
+
+    conflict_params = {};
+    argv = {"binary_name", "-m", "model_file.gguf", "--moe-cache-experts", "64", "--n-cpu-moe", "1"};
+    assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), conflict_params, LLAMA_EXAMPLE_COMMON));
+
+    conflict_params = {};
+    argv = {"binary_name", "-m", "model_file.gguf", "--moe-cache-experts", "64", "--split-mode", "tensor"};
+    assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), conflict_params, LLAMA_EXAMPLE_COMMON));
+
     printf("test-arg-parser: test valid usage\n\n");
 
     argv = {"binary_name", "-m", "model_file.gguf"};
@@ -146,6 +161,11 @@ static void test(void) {
     argv = {"binary_name", "-lm", "dio"};
     assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
     assert(params.load_mode == LLAMA_LOAD_MODE_DIRECT_IO);
+
+    argv = {"binary_name", "--moe-cache-experts", "64"};
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
+    assert(params.n_moe_cache_experts == 64);
+    assert(common_model_params_to_llama(params).n_moe_cache_experts == 64);
 
     // multi-value args (CSV)
     argv = {"binary_name", "--lora", "file1.gguf,\"file2,2.gguf\",\"file3\"\"3\"\".gguf\",file4\".gguf"};

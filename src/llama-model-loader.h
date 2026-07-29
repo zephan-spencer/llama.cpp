@@ -79,6 +79,7 @@ struct llama_model_loader {
     bool use_direct_io = false;
     bool check_tensors;
     bool no_alloc;
+    uint32_t n_moe_cache_experts;
 
     llama_files files;
     llama_ftype ftype;
@@ -130,7 +131,8 @@ struct llama_model_loader {
         bool check_tensors,
         bool no_alloc,
         const llama_model_kv_override * param_overrides_p,
-        const llama_model_tensor_buft_override * param_tensor_buft_overrides_p);
+        const llama_model_tensor_buft_override * param_tensor_buft_overrides_p,
+        uint32_t n_moe_cache_experts);
 
     template<typename T>
     typename std::enable_if<std::is_integral<T>::value, bool>::type

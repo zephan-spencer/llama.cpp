@@ -302,7 +302,8 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
         const std::string & fname, std::vector<std::string> & splits, FILE * file, llama_model_params & params) {
     try {
         llama_model_loader ml(metadata, set_tensor_data, set_tensor_data_ud, fname, splits, file, params.load_mode,
-            params.check_tensors, params.no_alloc, params.kv_overrides, params.tensor_buft_overrides);
+            params.check_tensors, params.no_alloc, params.kv_overrides, params.tensor_buft_overrides,
+            params.n_moe_cache_experts);
 
         ml.print_info();
         std::unique_ptr<llama_model> model_ptr(llama_model_create(ml, params));
@@ -331,6 +332,30 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
             model->load_hparams(ml);
         } catch(const std::exception & e) {
             throw std::runtime_error("error loading model hyperparameters: " + std::string(e.what()));
+        }
+        if (params.n_moe_cache_experts > 0) {
+            if (model->hparams.n_expert == 0) {
+                throw std::runtime_error("MoE expert cache: model has no routed experts");
+            }
+            if (params.n_moe_cache_experts < model->hparams.n_expert_used) {
+                throw std::runtime_error(
+                    "MoE expert cache: capacity must be at least the number of experts used per token (" +
+                    std::to_string(model->hparams.n_expert_used) + ")");
+            }
+            if (params.n_moe_cache_experts > model->hparams.n_expert) {
+                throw std::runtime_error(
+                    "MoE expert cache: capacity exceeds the model expert count (" +
+                    std::to_string(model->hparams.n_expert) + ")");
+            }
+            if (model->n_devices() != 1) {
+                throw std::runtime_error("MoE expert cache: exactly one GPU device is required");
+            }
+            if (model->n_gpu_layers() != model->hparams.n_layer_all + 1) {
+                throw std::runtime_error("MoE expert cache: all model layers must be offloaded to the GPU");
+            }
+            if (model->split_mode() == LLAMA_SPLIT_MODE_TENSOR) {
+                throw std::runtime_error("MoE expert cache: tensor parallelism is not supported");
+            }
         }
         if (model->arch == LLM_ARCH_CLIP) {
             throw std::runtime_error("CLIP cannot be used as main model, use it with --mmproj instead");
@@ -600,4 +625,3 @@ const char * llama_print_system_info(void) {
 
     return s.c_str();
 }
-

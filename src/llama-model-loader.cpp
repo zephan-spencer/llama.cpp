@@ -527,8 +527,10 @@ llama_model_loader::llama_model_loader(
         bool check_tensors,
         bool no_alloc,
         const llama_model_kv_override * param_overrides_p,
-        const llama_model_tensor_buft_override * param_tensor_buft_overrides_p)
-        : metadata(meta), set_tensor_data(set_tensor_data), set_tensor_data_ud(set_tensor_data_ud) {
+        const llama_model_tensor_buft_override * param_tensor_buft_overrides_p,
+        uint32_t n_moe_cache_experts)
+        : n_moe_cache_experts(n_moe_cache_experts), metadata(meta),
+          set_tensor_data(set_tensor_data), set_tensor_data_ud(set_tensor_data_ud) {
     int trace = 0;
     if (getenv("LLAMA_TRACE")) {
         trace = atoi(getenv("LLAMA_TRACE"));
@@ -1147,6 +1149,14 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         }
 
         ggml_backend_buffer_type_t buft = nullptr;
+        const bool moe_cache_weight =
+            n_moe_cache_experts > 0 &&
+            tn.suffix != nullptr &&
+            strcmp(tn.suffix, "weight") == 0 &&
+            (tn.tensor == LLM_TENSOR_FFN_DOWN_EXPS ||
+             tn.tensor == LLM_TENSOR_FFN_GATE_EXPS ||
+             tn.tensor == LLM_TENSOR_FFN_UP_EXPS ||
+             tn.tensor == LLM_TENSOR_FFN_GATE_UP_EXPS);
 
         // check overrides
         if (tensor_buft_overrides) {
@@ -1154,6 +1164,11 @@ struct ggml_tensor * llama_model_loader::create_tensor(
             for (const auto * overrides = tensor_buft_overrides; overrides->pattern != nullptr; ++overrides) {
                 std::regex pattern(overrides->pattern);
                 if (std::regex_search(tensor_name, pattern)) {
+                    if (moe_cache_weight) {
+                        throw std::runtime_error(
+                            "MoE expert cache: tensor buffer override conflicts with routed expert weight " +
+                            tensor_name);
+                    }
                     if (overrides->buft == ggml_backend_cpu_buffer_type()) {
                         // when overriding to a CPU buffer, consider the extra buffer types
                         buft = select_weight_buft(hparams, t_meta, op, buft_list_cpu);
@@ -1173,6 +1188,14 @@ struct ggml_tensor * llama_model_loader::create_tensor(
                             ggml_backend_buft_name(buft));
                     break;
                 }
+            }
+        }
+
+        if (moe_cache_weight) {
+            buft = select_weight_buft(hparams, t_meta, op, buft_list_cpu);
+            if (!buft) {
+                throw std::runtime_error(
+                    "MoE expert cache: failed to find a host buffer type for " + tn.str());
             }
         }
 

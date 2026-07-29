@@ -8,6 +8,7 @@
 #include "llama-io.h"
 #include "llama-memory.h"
 #include "llama-mmap.h"
+#include "llama-moe-cache.h"
 #include "llama-model.h"
 #include "llama-ext.h"
 #include "llama.h"
@@ -418,6 +419,18 @@ llama_context::llama_context(
 
         LLAMA_LOG_DEBUG("%s: backend_ptrs.size() = %zu\n", __func__, backend_ptrs.size());
 
+        if (model.n_moe_cache_experts() > 0) {
+            moe_cache = std::make_unique<llama_moe_expert_cache>(
+                model, backend_ptrs, model.n_moe_cache_experts());
+
+            const uint32_t n_cacheable_tokens = model.n_moe_cache_experts() / hparams.n_expert_used;
+            if (cparams.n_ubatch > n_cacheable_tokens) {
+                LLAMA_LOG_INFO(
+                    "%s: MoE expert cache handles graphs of up to %u tokens; larger graphs use streamed weights (n_ubatch = %u)\n",
+                    __func__, n_cacheable_tokens, cparams.n_ubatch);
+            }
+        }
+
         // TODO: move these checks to ggml_backend_sched
         // enabling pipeline parallelism in the scheduler increases memory usage, so it is only done when necessary
         bool pipeline_parallel =
@@ -692,6 +705,11 @@ void llama_context::sched_reserve() {
 
     LLAMA_LOG_INFO("%s: reserve took %.2f ms, sched copies = %d\n",
             __func__, (t_end_us - t_start_us)/1000.0, ggml_backend_sched_get_n_copies(sched.get()));
+
+    if (moe_cache) {
+        moe_cache->synchronize();
+        moe_cache->print_info();
+    }
 }
 
 void llama_context::synchronize() {
@@ -2424,6 +2442,7 @@ llm_graph_params llama_context::graph_params(
         /*.gtype       =*/ gtype,
         /*.sched       =*/ sched.get(),
         /*.backend_cpu =*/ backend_cpu,
+        /*.moe_cache   =*/ moe_cache.get(),
         /*.cvec        =*/ cvec.get(),
         /*.loras       =*/ loras.get(),
         /*.mctx        =*/ mctx,
@@ -2438,6 +2457,10 @@ llm_graph_params llama_context::graph_params(
 ggml_status llama_context::graph_compute(
             ggml_cgraph * gf,
                    bool   batched) {
+    if (moe_cache) {
+        moe_cache->synchronize();
+    }
+
     int n_threads        = batched ? cparams.n_threads_batch : cparams.n_threads;
     ggml_threadpool_t tp = batched ? threadpool_batch        : threadpool;
 
@@ -3211,6 +3234,15 @@ void llama_context::perf_reset() {
     t_eval_us   = n_eval = 0;
     t_p_eval_us = n_p_eval = 0;
     n_reused    = 0;
+    if (moe_cache) {
+        moe_cache->reset_stats();
+    }
+}
+
+void llama_context::perf_print_cache() const {
+    if (moe_cache) {
+        moe_cache->print_stats();
+    }
 }
 
 llama_memory_breakdown llama_context::memory_breakdown() const {
@@ -3220,6 +3252,11 @@ llama_memory_breakdown llama_context::memory_breakdown() const {
     }
     if (memory) {
         for (const auto & [buft, size] : memory->memory_breakdown()) {
+            ret[buft].context += size;
+        }
+    }
+    if (moe_cache) {
+        for (const auto & [buft, size] : moe_cache->memory_breakdown()) {
             ret[buft].context += size;
         }
     }
@@ -4107,6 +4144,9 @@ void llama_perf_context_print(const llama_context * ctx) {
             __func__, data.t_eval_ms, data.n_eval, data.t_eval_ms / data.n_eval, 1e3 / data.t_eval_ms * data.n_eval);
     LLAMA_LOG_INFO("%s:       total time = %10.2f ms / %5d tokens\n", __func__, (t_end_ms - data.t_start_ms), (data.n_p_eval + data.n_eval));
     LLAMA_LOG_INFO("%s:    graphs reused = %10d\n", __func__, data.n_reused);
+    if (ctx != nullptr) {
+        ctx->perf_print_cache();
+    }
 }
 
 void llama_perf_context_reset(llama_context * ctx) {

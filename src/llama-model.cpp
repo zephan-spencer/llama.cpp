@@ -1702,6 +1702,10 @@ uint32_t llama_model::n_gpu_layers() const {
     return params.n_gpu_layers >= 0 ? params.n_gpu_layers : hparams.n_layer_all + 1;
 }
 
+uint32_t llama_model::n_moe_cache_experts() const {
+    return params.n_moe_cache_experts;
+}
+
 llama_split_mode llama_model::split_mode() const {
     return params.split_mode;
 }
@@ -2321,6 +2325,7 @@ llama_model_params llama_model_default_params() {
         /*.devices                     =*/ nullptr,
         /*.tensor_buft_overrides       =*/ nullptr,
         /*.n_gpu_layers                =*/ -1,
+        /*.n_moe_cache_experts         =*/ 0,
         /*.split_mode                  =*/ LLAMA_SPLIT_MODE_LAYER,
         /*.load_mode                   =*/ LLAMA_LOAD_MODE_MMAP,
         /*.main_gpu                    =*/ 0,

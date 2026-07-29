@@ -370,6 +370,10 @@ static void common_params_fit_impl(
     if (nd == 0) {
         throw common_params_fit_exception("was unable to fit model into system memory by reducing context, abort");
     }
+    if (mparams->n_moe_cache_experts > 0) {
+        throw common_params_fit_exception(
+            "static model weights, context, compute buffers, and the requested MoE expert cache do not fit on the GPU, abort");
+    }
 
     if (mparams->n_gpu_layers != default_mparams.n_gpu_layers) {
         throw common_params_fit_exception("n_gpu_layers already set by user to " + std::to_string(mparams->n_gpu_layers) + ", abort");

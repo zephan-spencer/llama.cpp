@@ -811,6 +811,12 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
     if (params.prompt_cache_all && (params.interactive || params.interactive_first)) {
         throw std::invalid_argument("error: --prompt-cache-all not supported in interactive mode yet\n");
     }
+    if (params.n_moe_cache_experts > 0 && params.cpu_moe) {
+        throw std::invalid_argument("error: --moe-cache-experts cannot be combined with --cpu-moe or --n-cpu-moe\n");
+    }
+    if (params.n_moe_cache_experts > 0 && params.split_mode == LLAMA_SPLIT_MODE_TENSOR) {
+        throw std::invalid_argument("error: --moe-cache-experts does not support tensor parallelism\n");
+    }
 
     const bool skip_model_download =
         // server will call common_params_handle_models() later, so we skip it here
@@ -2600,6 +2606,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         {"-cmoe", "--cpu-moe"},
         "keep all Mixture of Experts (MoE) weights in the CPU",
         [](common_params & params) {
+            params.cpu_moe = true;
             params.tensor_buft_overrides.push_back(llm_ffn_exps_cpu_override());
         }
     ).set_env("LLAMA_ARG_CPU_MOE"));
@@ -2610,6 +2617,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             if (value < 0) {
                 throw std::invalid_argument("invalid value");
             }
+            params.cpu_moe = params.cpu_moe || value > 0;
             for (int i = 0; i < value; ++i) {
                 // keep strings alive and avoid leaking memory by storing them in a static vector
                 static std::list<std::string> buft_overrides;
@@ -2618,6 +2626,16 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             }
         }
     ).set_env("LLAMA_ARG_N_CPU_MOE"));
+    add_opt(common_arg(
+        {"--moe-cache-experts"}, "N",
+        "keep routed expert weights in host memory and cache N experts per MoE layer on one GPU (default: 0)",
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.n_moe_cache_experts = value;
+        }
+    ).set_env("LLAMA_ARG_MOE_CACHE_EXPERTS"));
     GGML_ASSERT(params.n_gpu_layers < 0); // string_format would need to be extended for a default >= 0
     add_opt(common_arg(
         {"-ngl", "--gpu-layers", "--n-gpu-layers"}, "N",

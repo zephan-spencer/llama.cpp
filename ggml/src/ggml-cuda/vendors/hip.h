@@ -80,7 +80,7 @@
 #define cudaLaunchCooperativeKernel hipLaunchCooperativeKernel
 #define cudaLaunchHostFunc hipLaunchHostFunc
 #define cudaMalloc hipMalloc
-#define cudaMallocHost(ptr, size) hipHostMalloc(ptr, size, hipHostMallocDefault)
+#define cudaMallocHost(ptr, size) hipHostMalloc(ptr, size, hipHostMallocMapped)
 #define cudaMallocManaged hipMallocManaged
 #define cudaMemAdvise hipMemAdvise
 #define cudaMemcpy hipMemcpy

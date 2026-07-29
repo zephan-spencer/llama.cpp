@@ -16,6 +16,7 @@
 
 struct llama_model;
 class llama_batch_allocr;
+class llama_moe_expert_cache;
 
 class llama_io_read_i;
 class llama_io_write_i;
@@ -185,6 +186,7 @@ struct llama_context {
     //
 
     llama_perf_context_data perf_get_data() const;
+    void perf_print_cache() const;
     void perf_reset();
 
     llama_memory_breakdown memory_breakdown() const;
@@ -347,6 +349,7 @@ private:
 
     ggml_backend_t backend_cpu = nullptr;
     std::vector<ggml_backend_ptr> backends;
+    std::unique_ptr<llama_moe_expert_cache> moe_cache;
 
     // training
     ggml_opt_context_t opt_ctx = nullptr;

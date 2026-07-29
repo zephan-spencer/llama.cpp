@@ -89,6 +89,7 @@ struct llama_cross {
 };
 
 struct llm_graph_params;
+class llama_moe_expert_cache;
 
 //
 // llm_graph_input
@@ -682,6 +683,7 @@ struct llm_graph_params {
 
     ggml_backend_sched_t sched;
     ggml_backend_t backend_cpu;
+    llama_moe_expert_cache * moe_cache;
 
     const llama_adapter_cvec     * cvec;
     const llama_adapter_loras    * loras;
@@ -779,6 +781,7 @@ struct llm_graph_params {
             cparams.causal_attn             == other.cparams.causal_attn             &&
             arch  == other.arch  &&
             gtype == other.gtype &&
+            moe_cache == other.moe_cache &&
             cvec  == other.cvec  &&
             loras == other.loras &&
             cross == other.cross;
@@ -922,6 +925,7 @@ struct llm_graph_context {
     ggml_backend_sched_t sched;
 
     ggml_backend_t backend_cpu; // TODO: needed by build_attn_mha, figure out a way to remove?
+    llama_moe_expert_cache * moe_cache;
 
     const llama_adapter_cvec     * cvec;
     const llama_adapter_loras    * loras;
@@ -958,9 +962,11 @@ struct llm_graph_context {
 
     // do mat_mul_id, while optionally apply lora and per-expert scale
     ggml_tensor * build_lora_mm_id(
-              ggml_tensor * w,   // ggml_tensor * as
-              ggml_tensor * cur, // ggml_tensor * b
+              ggml_tensor * w,           // ggml_tensor * as
+              ggml_tensor * w_compute,
+              ggml_tensor * cur,         // ggml_tensor * b
               ggml_tensor * ids,
+              ggml_tensor * ids_compute,
               ggml_tensor * w_s = nullptr) const;
 
     ggml_tensor * build_norm(
