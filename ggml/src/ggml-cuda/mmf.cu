@@ -84,8 +84,13 @@ void ggml_cuda_mul_mat_f(ggml_backend_cuda_context & ctx, const ggml_tensor * sr
 
         GGML_ASSERT(sis1 > 0);
 
-        ggml_cuda_launch_mm_ids_helper(ids_d, ids_src_compact_dev.get(), ids_dst_compact_dev.get(), expert_bounds_dev.get(),
-            static_cast<int>(n_experts), static_cast<int>(n_tokens), static_cast<int>(n_expert_used), static_cast<int>(ne11), si1, sis1, /*write_inverse =*/ false, ctx.stream());
+        ggml_cuda_expert_plan plan = {};
+        plan.ids_src = ids_src_compact_dev.get();
+        plan.ids_dst = ids_dst_compact_dev.get();
+        plan.expert_bounds = expert_bounds_dev.get();
+        ggml_cuda_launch_expert_plan(ids_d, plan,
+            static_cast<int>(n_experts), static_cast<int>(n_tokens), static_cast<int>(n_expert_used), static_cast<int>(ne11), si1, sis1,
+            /*write_inverse =*/ false, /*n_cache =*/ 0, ctx.stream());
         CUDA_CHECK(cudaGetLastError());
 
         ids_info.ids_src_compact   = ids_src_compact_dev.get();

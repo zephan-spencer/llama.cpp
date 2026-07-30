@@ -1,5 +1,35 @@
 #pragma once
 
-void ggml_cuda_launch_mm_ids_helper(
-        const int32_t * ids, int32_t * ids_src1, int32_t * ids_dst, int32_t * expert_bounds,
-        int n_experts, int n_tokens, int n_expert_used, int nchannels_y, int si1, int sis1, bool write_inverse, cudaStream_t stream);
+struct ggml_cuda_expert_plan {
+    int32_t * ids_src;
+    int32_t * ids_dst;
+    int32_t * expert_bounds;
+
+    int32_t * expert_order;
+    int32_t * miss_expert;
+    int32_t * miss_slot;
+    int32_t * cache_ids;
+
+    int32_t * expert_to_cache;
+    int32_t * cache_to_expert;
+    uint64_t * last_used;
+    uint64_t * use_clock;
+
+    uint32_t * n_active;
+    uint32_t * n_resident;
+    uint32_t * n_miss;
+    uint32_t * n_evictions;
+};
+
+void ggml_cuda_launch_expert_plan(
+        const int32_t * ids,
+        const ggml_cuda_expert_plan & plan,
+        int n_experts,
+        int n_tokens,
+        int n_expert_used,
+        int nchannels_y,
+        int si1,
+        int sis1,
+        bool write_inverse,
+        int n_cache,
+        cudaStream_t stream);

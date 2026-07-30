@@ -20,7 +20,7 @@ extern "C" {
 #define GGML_CUDA_MAX_DEVICES       16
 #define GGML_CUDA_EXPERT_CACHE_MAX_WEIGHTS 4
 #define GGML_CUDA_EXPERT_CACHE_MAGIC 0x4558504341434845ULL
-#define GGML_CUDA_EXPERT_CACHE_VERSION 1
+#define GGML_CUDA_EXPERT_CACHE_VERSION 2
 
 struct ggml_backend_cuda_expert_cache_stats {
     uint64_t resolve_calls;
@@ -35,7 +35,10 @@ struct ggml_backend_cuda_expert_cache_state {
     uint64_t use_clock;
     struct ggml_backend_cuda_expert_cache_stats stats;
     uint64_t fill_start_ticks;
+    uint32_t n_active;
+    uint32_t n_resident;
     uint32_t n_fills;
+    uint32_t n_evictions;
     uint32_t copy_blocks_done;
 };
 
@@ -55,6 +58,9 @@ struct ggml_backend_cuda_expert_cache_desc {
     uint64_t expert_to_cache_offset;
     uint64_t cache_to_expert_offset;
     uint64_t last_used_offset;
+    uint64_t route_indices_offset;
+    uint64_t expert_bounds_offset;
+    uint64_t expert_order_offset;
     uint64_t fill_expert_offset;
     uint64_t fill_slot_offset;
     uint64_t state_size;

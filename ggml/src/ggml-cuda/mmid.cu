@@ -2,10 +2,10 @@
 #include "mmid.cuh"
 
 // To reduce shared memory use, store "it" and "iex_used" with 22/10 bits each.
-struct mm_ids_helper_store {
+struct expert_plan_route {
     uint32_t data;
 
-    __device__ mm_ids_helper_store(const uint32_t it, const uint32_t iex_used) {
+    __device__ expert_plan_route(const uint32_t it, const uint32_t iex_used) {
         data = (it & 0x003FFFFF) | (iex_used << 22);
     }
 
@@ -17,23 +17,23 @@ struct mm_ids_helper_store {
         return data >> 22;
     }
 };
-static_assert(sizeof(mm_ids_helper_store) == 4, "unexpected size for mm_ids_helper_store");
+static_assert(sizeof(expert_plan_route) == 4, "unexpected size for expert_plan_route");
 
-// Helper function for mul_mat_id, converts ids to a more convenient format.
+// Converts routed expert IDs to a compact expert-major plan.
 // ids_src1 describes how to permute the flattened column indices of src1 in order to get a compact src1 tensor sorted by expert.
 // ids_dst describes the same mapping but for the dst tensor.
 // The upper and lower bounds for the ith expert in the compact src1 tensor are stored in expert_bounds[i:i+1].
 template <int n_expert_used_template>
 __launch_bounds__(ggml_cuda_get_physical_warp_size(), 1)
-static __global__ void mm_ids_helper(
+static __global__ void expert_plan_routes(
         const int32_t * __restrict__ ids, int32_t * __restrict__ ids_src1, int32_t * __restrict__ ids_dst, int32_t * __restrict__ expert_bounds,
         const int n_tokens, const int n_expert_used_var, const int nchannels_y, const int si1, const int sis1, const bool write_inverse) {
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
     const int n_expert_used = n_expert_used_template == 0 ? n_expert_used_var : n_expert_used_template;
     const int expert = blockIdx.x;
 
-    extern __shared__ char data_mm_ids_helper[];
-    mm_ids_helper_store * store = (mm_ids_helper_store *) data_mm_ids_helper;
+    extern __shared__ char data_expert_plan[];
+    expert_plan_route * store = (expert_plan_route *) data_expert_plan;
 
     int nex_prev   = 0; // Number of columns for experts with a lower index.
     int it_compact = 0; // Running index for the compact slice of this expert.
@@ -51,7 +51,7 @@ static __global__ void mm_ids_helper(
             }
 
             if (iex_used != -1) {
-                store[it_compact] = mm_ids_helper_store(it, iex_used);
+                store[it_compact] = expert_plan_route(it, iex_used);
             }
 
             if (warp_reduce_any<warp_size>(iex_used != -1)) {
@@ -85,7 +85,7 @@ static __global__ void mm_ids_helper(
             }
 
             if (iex_used != -1) {
-                store[it_compact + it_compact_add_lower] = mm_ids_helper_store(it, iex_used);
+                store[it_compact + it_compact_add_lower] = expert_plan_route(it, iex_used);
             }
 
             // The thread with the highest index in the warp always has the sum over the whole warp, use it to increment all threads:
@@ -95,12 +95,14 @@ static __global__ void mm_ids_helper(
     nex_prev = warp_reduce_sum<warp_size>(nex_prev);
 
     for (int itc = threadIdx.x; itc < it_compact; itc += warp_size) {
-        const mm_ids_helper_store store_it = store[itc];
+        const expert_plan_route store_it = store[itc];
         const int it       = store_it.it();
         const int iex_used = store_it.iex_used();
         ids_dst[nex_prev + itc] = it*n_expert_used + iex_used;
         // ids_src1 holds the forward map, or the inverse map (token slot -> compact row) for quant dedup
-        if (write_inverse) {
+        if (ids_src1 == nullptr) {
+            continue;
+        } else if (write_inverse) {
             ids_src1[it*n_expert_used + iex_used] = nex_prev + itc;
         } else {
             ids_src1[nex_prev + itc] = it*sis1 + iex_used % nchannels_y;
@@ -121,49 +123,193 @@ static __global__ void mm_ids_helper(
 }
 
 template <int n_expert_used_template>
-static void launch_mm_ids_helper(
+static void launch_expert_plan_routes(
         const int32_t * __restrict__ ids, int32_t * __restrict__ ids_src1, int32_t * __restrict__ ids_dst, int32_t * __restrict__ expert_bounds,
         const int n_experts, const int n_tokens, const int n_expert_used_var, const int nchannels_y, const int si1, const int sis1, const bool write_inverse, cudaStream_t stream) {
-    GGML_ASSERT(n_tokens          < (1 << 22) && "too few bits in mm_ids_helper_store");
-    GGML_ASSERT(n_expert_used_var < (1 << 10) && "too few bits in mm_ids_helper_store");
+    GGML_ASSERT(n_tokens          < (1 << 22) && "too few bits in expert_plan_route");
+    GGML_ASSERT(n_expert_used_var < (1 << 10) && "too few bits in expert_plan_route");
 
     const int id = ggml_cuda_get_device();
     const int warp_size = ggml_cuda_info().devices[id].warp_size;
     const size_t smpbo = ggml_cuda_info().devices[id].smpbo;
-    CUDA_SET_SHARED_MEMORY_LIMIT(mm_ids_helper<n_expert_used_template>, smpbo);
+    CUDA_SET_SHARED_MEMORY_LIMIT(expert_plan_routes<n_expert_used_template>, smpbo);
 
     const dim3 num_blocks(n_experts, 1, 1);
     const dim3 block_size(warp_size, 1, 1);
-    const size_t nbytes_shared = n_tokens*sizeof(mm_ids_helper_store);
+    const size_t nbytes_shared = n_tokens*sizeof(expert_plan_route);
     GGML_ASSERT(nbytes_shared <= smpbo);
-    mm_ids_helper<n_expert_used_template><<<num_blocks, block_size, nbytes_shared, stream>>>
+    expert_plan_routes<n_expert_used_template><<<num_blocks, block_size, nbytes_shared, stream>>>
         (ids, ids_src1, ids_dst, expert_bounds, n_tokens, n_expert_used_var, nchannels_y, si1, sis1, write_inverse);
 }
 
-void ggml_cuda_launch_mm_ids_helper(
-        const int32_t * __restrict__ ids, int32_t * __restrict__ ids_src1, int32_t * __restrict__ ids_dst, int32_t * __restrict__ expert_bounds,
-        const int n_experts, const int n_tokens, const int n_expert_used, const int nchannels_y, const int si1, const int sis1, const bool write_inverse, cudaStream_t stream) {
+static __global__ void expert_plan_cache(
+        const int32_t * ids,
+        ggml_cuda_expert_plan plan,
+        int64_t n_ids,
+        int n_experts,
+        int n_cache) {
+    extern __shared__ int32_t scratch[];
+
+    int32_t * requested = scratch;
+    int32_t * unique = requested + n_experts;
+
+    for (int expert = threadIdx.x; expert < n_experts; expert += blockDim.x) {
+        requested[expert] = 0;
+    }
+    __syncthreads();
+
+    if (threadIdx.x != 0) {
+        return;
+    }
+
+    int32_t n_active = 0;
+    for (int64_t i = 0; i < n_ids; ++i) {
+        const int32_t expert = ids[i];
+        assert(expert >= 0 && expert < n_experts);
+        if (!requested[expert]) {
+            requested[expert] = 1;
+            unique[n_active++] = expert;
+        }
+    }
+    assert(n_active <= n_cache);
+
+    int32_t n_resident = 0;
+    for (int32_t i = 0; i < n_active; ++i) {
+        const int32_t expert = unique[i];
+        if (plan.expert_to_cache[expert] >= 0) {
+            plan.expert_order[n_resident++] = expert;
+        }
+    }
+
+    int32_t n_miss = 0;
+    int32_t n_evictions = 0;
+    for (int32_t i = 0; i < n_active; ++i) {
+        const int32_t expert = unique[i];
+        if (plan.expert_to_cache[expert] >= 0) {
+            continue;
+        }
+
+        int32_t victim = -1;
+        for (int32_t slot = 0; slot < n_cache; ++slot) {
+            if (plan.cache_to_expert[slot] < 0) {
+                victim = slot;
+                break;
+            }
+        }
+
+        if (victim < 0) {
+            uint64_t oldest = UINT64_MAX;
+            for (int32_t slot = 0; slot < n_cache; ++slot) {
+                const int32_t resident = plan.cache_to_expert[slot];
+                if (!requested[resident] && plan.last_used[slot] < oldest) {
+                    oldest = plan.last_used[slot];
+                    victim = slot;
+                }
+            }
+        }
+        assert(victim >= 0);
+
+        const int32_t evicted = plan.cache_to_expert[victim];
+        if (evicted >= 0) {
+            plan.expert_to_cache[evicted] = -1;
+            n_evictions++;
+        }
+
+        plan.cache_to_expert[victim] = expert;
+        plan.expert_order[n_resident + n_miss] = expert;
+        plan.miss_expert[n_miss] = expert;
+        plan.miss_slot[n_miss] = victim;
+        n_miss++;
+    }
+
+    for (int32_t i = 0; i < n_miss; ++i) {
+        const int32_t expert = plan.miss_expert[i];
+        const int32_t slot = plan.miss_slot[i];
+        plan.expert_to_cache[expert] = slot;
+        plan.cache_to_expert[slot] = expert;
+    }
+
+    const uint64_t use_clock = ++*plan.use_clock;
+    for (int32_t i = 0; i < n_active; ++i) {
+        const int32_t slot = plan.expert_to_cache[unique[i]];
+        assert(slot >= 0);
+        plan.last_used[slot] = use_clock;
+    }
+
+    for (int64_t i = 0; i < n_ids; ++i) {
+        const int32_t slot = plan.expert_to_cache[ids[i]];
+        assert(slot >= 0);
+        plan.cache_ids[i] = slot;
+    }
+
+    *plan.n_active = n_active;
+    *plan.n_resident = n_resident;
+    *plan.n_miss = n_miss;
+    *plan.n_evictions = n_evictions;
+}
+
+void ggml_cuda_launch_expert_plan(
+        const int32_t * ids,
+        const ggml_cuda_expert_plan & plan,
+        const int n_experts,
+        const int n_tokens,
+        const int n_expert_used,
+        const int nchannels_y,
+        const int si1,
+        const int sis1,
+        const bool write_inverse,
+        const int n_cache,
+        cudaStream_t stream) {
+    GGML_ASSERT(ids != nullptr);
+    GGML_ASSERT(plan.ids_dst != nullptr);
+    GGML_ASSERT(plan.expert_bounds != nullptr);
+
     switch (n_expert_used) {
         case  2:
-            launch_mm_ids_helper< 2>(ids, ids_src1, ids_dst, expert_bounds, n_experts, n_tokens, n_expert_used, nchannels_y, si1, sis1, write_inverse, stream);
+            launch_expert_plan_routes< 2>(ids, plan.ids_src, plan.ids_dst, plan.expert_bounds, n_experts, n_tokens, n_expert_used, nchannels_y, si1, sis1, write_inverse, stream);
             break;
         case  4:
-            launch_mm_ids_helper< 4>(ids, ids_src1, ids_dst, expert_bounds, n_experts, n_tokens, n_expert_used, nchannels_y, si1, sis1, write_inverse, stream);
+            launch_expert_plan_routes< 4>(ids, plan.ids_src, plan.ids_dst, plan.expert_bounds, n_experts, n_tokens, n_expert_used, nchannels_y, si1, sis1, write_inverse, stream);
             break;
         case  6:
-            launch_mm_ids_helper< 6>(ids, ids_src1, ids_dst, expert_bounds, n_experts, n_tokens, n_expert_used, nchannels_y, si1, sis1, write_inverse, stream);
+            launch_expert_plan_routes< 6>(ids, plan.ids_src, plan.ids_dst, plan.expert_bounds, n_experts, n_tokens, n_expert_used, nchannels_y, si1, sis1, write_inverse, stream);
             break;
         case  8:
-            launch_mm_ids_helper< 8>(ids, ids_src1, ids_dst, expert_bounds, n_experts, n_tokens, n_expert_used, nchannels_y, si1, sis1, write_inverse, stream);
+            launch_expert_plan_routes< 8>(ids, plan.ids_src, plan.ids_dst, plan.expert_bounds, n_experts, n_tokens, n_expert_used, nchannels_y, si1, sis1, write_inverse, stream);
             break;
         case 16:
-            launch_mm_ids_helper<16>(ids, ids_src1, ids_dst, expert_bounds, n_experts, n_tokens, n_expert_used, nchannels_y, si1, sis1, write_inverse, stream);
+            launch_expert_plan_routes<16>(ids, plan.ids_src, plan.ids_dst, plan.expert_bounds, n_experts, n_tokens, n_expert_used, nchannels_y, si1, sis1, write_inverse, stream);
             break;
         case 32:
-            launch_mm_ids_helper<32>(ids, ids_src1, ids_dst, expert_bounds, n_experts, n_tokens, n_expert_used, nchannels_y, si1, sis1, write_inverse, stream);
+            launch_expert_plan_routes<32>(ids, plan.ids_src, plan.ids_dst, plan.expert_bounds, n_experts, n_tokens, n_expert_used, nchannels_y, si1, sis1, write_inverse, stream);
             break;
         default:
-            launch_mm_ids_helper< 0>(ids, ids_src1, ids_dst, expert_bounds, n_experts, n_tokens, n_expert_used, nchannels_y, si1, sis1, write_inverse, stream);
+            launch_expert_plan_routes< 0>(ids, plan.ids_src, plan.ids_dst, plan.expert_bounds, n_experts, n_tokens, n_expert_used, nchannels_y, si1, sis1, write_inverse, stream);
             break;
     }
+
+    if (plan.expert_order == nullptr) {
+        return;
+    }
+
+    GGML_ASSERT(n_cache > 0 && n_cache <= n_experts);
+    GGML_ASSERT(plan.miss_expert != nullptr);
+    GGML_ASSERT(plan.miss_slot != nullptr);
+    GGML_ASSERT(plan.cache_ids != nullptr);
+    GGML_ASSERT(plan.expert_to_cache != nullptr);
+    GGML_ASSERT(plan.cache_to_expert != nullptr);
+    GGML_ASSERT(plan.last_used != nullptr);
+    GGML_ASSERT(plan.use_clock != nullptr);
+    GGML_ASSERT(plan.n_active != nullptr);
+    GGML_ASSERT(plan.n_resident != nullptr);
+    GGML_ASSERT(plan.n_miss != nullptr);
+    GGML_ASSERT(plan.n_evictions != nullptr);
+
+    const size_t shared_size = 2 * n_experts * sizeof(int32_t);
+    expert_plan_cache<<<1, 256, shared_size, stream>>>(
+        ids,
+        plan,
+        (int64_t) n_tokens * n_expert_used,
+        n_experts,
+        n_cache);
 }

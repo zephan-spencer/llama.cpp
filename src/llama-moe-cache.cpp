@@ -184,6 +184,12 @@ struct llama_moe_expert_cache::impl {
             offset = result->device_desc.cache_to_expert_offset + n_cache_experts * sizeof(int32_t);
             result->device_desc.last_used_offset = align_offset(offset, alignof(uint64_t));
             offset = result->device_desc.last_used_offset + n_cache_experts * sizeof(uint64_t);
+            result->device_desc.route_indices_offset = align_offset(offset, alignof(int32_t));
+            offset = result->device_desc.route_indices_offset + n_cache_experts * sizeof(int32_t);
+            result->device_desc.expert_bounds_offset = align_offset(offset, alignof(int32_t));
+            offset = result->device_desc.expert_bounds_offset + (n_expert + 1) * sizeof(int32_t);
+            result->device_desc.expert_order_offset = align_offset(offset, alignof(int32_t));
+            offset = result->device_desc.expert_order_offset + n_cache_experts * sizeof(int32_t);
             result->device_desc.fill_expert_offset = align_offset(offset, alignof(int32_t));
             offset = result->device_desc.fill_expert_offset + n_cache_experts * sizeof(int32_t);
             result->device_desc.fill_slot_offset = align_offset(offset, alignof(int32_t));
