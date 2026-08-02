@@ -452,7 +452,8 @@ Mixed server validation MUST capture one physical ubatch containing at least one
 
 | Name | Definition |
 | --- | --- |
-| clean cache baseline | clean `bdd5eaa9b` build with matching options |
+| decode regression baseline | clean `cd034f6fa` build with matching options |
+| prefill control | candidate build with source-aware cache execution disabled and matching options |
 | candidate | source-aware implementation under evaluation |
 | all-resident ceiling | candidate build with cache option omitted |
 
@@ -488,9 +489,9 @@ One tested capacity MUST satisfy all gates:
 
 1. maximum absolute and relative logit errors satisfy the declared tolerances;
 2. deterministic generated tokens match the all-resident comparison;
-3. median prompt throughput improvement is at least 10 percent over the clean cache baseline at 512 tokens;
-4. median prompt throughput improvement is at least 10 percent over the clean cache baseline at 2048 tokens;
-5. median cached decode throughput is at least 95 percent of the clean cache baseline.
+3. median prompt throughput improvement is at least 10 percent over the prefill control at 512 tokens;
+4. median prompt throughput improvement is at least 10 percent over the prefill control at 2048 tokens;
+5. median cached decode throughput is at least 95 percent of the decode regression baseline.
 
 Prompt improvement uses:
 
