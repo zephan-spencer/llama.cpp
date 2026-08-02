@@ -142,6 +142,9 @@ static llama_ubatch dsv4_build_raw_write_ubatch(const llama_ubatch & ubatch) {
             }
             data->n_seq_id.push_back(1);
             data->seq_id_data.push_back(seq_id);
+            if (ubatch.moe_cache_policy) {
+                data->moe_cache_policy.push_back(ubatch.moe_cache_policy[i]);
+            }
         }
     }
 
@@ -164,6 +167,7 @@ static llama_ubatch dsv4_build_raw_write_ubatch(const llama_ubatch & ubatch) {
         /*.seq_id_unq   =*/ data->seq_id_unq.data(),
         /*.seq_idx      =*/ data->seq_idx.data(),
         /*.output       =*/ data->output.data(),
+        /*.moe_cache_policy =*/ ubatch.moe_cache_policy ? data->moe_cache_policy.data() : nullptr,
         /*.data         =*/ data,
     };
 

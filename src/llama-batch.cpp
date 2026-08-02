@@ -224,6 +224,7 @@ bool llama_batch_allocr::init(
             /*.seq_id_unq   =*/ this->seq_id_unq.data(),
             /*.seq_idx      =*/ this->seq_idx.data(),
             /*.output       =*/ batch.logits,
+            /*.moe_cache_policy =*/ batch.moe_cache_policy,
             /*.data         =*/ {},
         };
 
@@ -408,6 +409,7 @@ llama_ubatch llama_batch_allocr::ubatch_reserve(uint32_t n_seq_tokens, uint32_t 
     udata->seq_id_unq.resize(0);
     udata->seq_idx   .resize(LLAMA_MAX_SEQ, -1);
     udata->output    .resize(n_tokens);
+    udata->moe_cache_policy.resize(n_tokens);
 
     for (uint32_t s = 0; s < n_seqs; ++s) {
         udata->seq_idx[s] = s;
@@ -430,6 +432,7 @@ llama_ubatch llama_batch_allocr::ubatch_reserve(uint32_t n_seq_tokens, uint32_t 
         /*.seq_id_unq   =*/ udata->seq_id_unq.data(),
         /*.seq_idx      =*/ udata->seq_idx.data(),
         /*.output       =*/ udata->output.data(),
+        /*.moe_cache_policy =*/ nullptr,
         /*.data         =*/ std::move(udata),
     };
 
@@ -764,6 +767,7 @@ llama_ubatch llama_batch_allocr::ubatch_add(const std::vector<int32_t> & idxs, u
     udata->seq_id_unq.resize(0);
     udata->seq_idx   .resize(LLAMA_MAX_SEQ, -1);
     udata->output    .resize(n_tokens);
+    udata->moe_cache_policy.resize(n_tokens);
 
     udata->seq_id_data.reserve(n_tokens);
 
@@ -789,6 +793,9 @@ llama_ubatch llama_batch_allocr::ubatch_add(const std::vector<int32_t> & idxs, u
 
         udata->n_seq_id[i] = batch.n_seq_id[idxs[i]];
         udata->output[i]   = batch.logits[idxs[i]];
+        if (batch.moe_cache_policy) {
+            udata->moe_cache_policy[i] = batch.moe_cache_policy[idxs[i]];
+        }
 
         for (int s = 0; s < udata->n_seq_id[i]; ++s) {
             const llama_seq_id seq_id = batch.seq_id[idxs[i]][s];
@@ -831,6 +838,7 @@ llama_ubatch llama_batch_allocr::ubatch_add(const std::vector<int32_t> & idxs, u
         /*.seq_id_unq   =*/ udata->seq_id_unq.data(),
         /*.seq_idx      =*/ udata->seq_idx.data(),
         /*.output       =*/ udata->output.data(),
+        /*.moe_cache_policy =*/ batch.moe_cache_policy ? udata->moe_cache_policy.data() : nullptr,
         /*.data         =*/ std::move(udata),
     };
 
@@ -939,6 +947,7 @@ struct llama_batch llama_batch_get_one(
         /*n_seq_id =*/ nullptr,
         /*seq_id   =*/ nullptr,
         /*logits   =*/ nullptr,
+        /*moe_cache_policy =*/ nullptr,
     };
 }
 
@@ -951,6 +960,7 @@ struct llama_batch llama_batch_init(int32_t n_tokens_alloc, int32_t embd, int32_
         /*n_seq_id =*/ nullptr,
         /*seq_id   =*/ nullptr,
         /*logits   =*/ nullptr,
+        /*moe_cache_policy =*/ nullptr,
     };
 
     if (embd) {
@@ -968,6 +978,7 @@ struct llama_batch llama_batch_init(int32_t n_tokens_alloc, int32_t embd, int32_
     batch.seq_id[n_tokens_alloc] = nullptr;
 
     batch.logits   = (int8_t *)        malloc(sizeof(int8_t)         * n_tokens_alloc);
+    batch.moe_cache_policy = nullptr;
 
     return batch;
 }

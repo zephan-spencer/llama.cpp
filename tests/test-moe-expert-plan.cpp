@@ -61,6 +61,7 @@ struct test_case {
     std::vector<int32_t> cache_to_expert;
     std::vector<uint64_t> last_used;
     uint64_t use_clock = 0;
+    std::vector<uint8_t> policy;
 };
 
 struct plan_result {
@@ -68,8 +69,8 @@ struct plan_result {
     std::vector<int32_t> ids_dst;
     std::vector<int32_t> expert_bounds;
     std::vector<int32_t> expert_order;
-    std::vector<int32_t> miss_expert;
-    std::vector<int32_t> miss_slot;
+    std::vector<int32_t> fill_expert;
+    std::vector<int32_t> fill_slot;
     std::vector<int32_t> cache_ids;
     std::vector<int32_t> expert_to_cache;
     std::vector<int32_t> cache_to_expert;
@@ -78,7 +79,10 @@ struct plan_result {
     uint32_t n_active = 0;
     uint32_t n_resident = 0;
     uint32_t n_miss = 0;
+    uint32_t n_fill = 0;
     uint32_t n_evictions = 0;
+    uint32_t n_read_only = 0;
+    uint32_t n_streamed = 0;
 };
 
 static std::vector<int32_t> make_expert_to_cache(const test_case & test) {
@@ -100,8 +104,8 @@ static plan_result make_reference(const test_case & test) {
     result.ids_dst.resize(n_ids);
     result.expert_bounds.resize(test.n_expert + 1);
     result.expert_order.resize(test.n_cache);
-    result.miss_expert.resize(test.n_cache);
-    result.miss_slot.resize(test.n_cache);
+    result.fill_expert.resize(test.n_cache);
+    result.fill_slot.resize(test.n_cache);
     result.cache_ids.resize(n_ids);
     result.expert_to_cache = make_expert_to_cache(test);
     result.cache_to_expert = test.cache_to_expert;
@@ -124,13 +128,26 @@ static plan_result make_reference(const test_case & test) {
     }
     result.expert_bounds[test.n_expert] = compact;
 
+    const bool compatibility = !test.policy.empty() && test.policy[0] == 2;
     std::vector<bool> requested(test.n_expert, false);
     std::vector<int32_t> unique;
-    for (int32_t expert : test.ids) {
+    for (int32_t route = 0; route < n_ids; ++route) {
+        const int32_t expert = test.ids[route];
+        const bool update = compatibility || test.policy.empty() || test.policy[route / test.n_expert_used] == 1;
+        result.n_read_only += !update;
+        if (!update) {
+            continue;
+        }
         if (!requested[expert]) {
             requested[expert] = true;
             unique.push_back(expert);
         }
+    }
+
+    if (compatibility && (int32_t) unique.size() > test.n_cache) {
+        std::fill(requested.begin(), requested.end(), false);
+        result.n_read_only = n_ids;
+        unique.clear();
     }
 
     result.n_active = unique.size();
@@ -144,6 +161,7 @@ static plan_result make_reference(const test_case & test) {
         if (result.expert_to_cache[expert] >= 0) {
             continue;
         }
+        result.n_miss++;
 
         int32_t victim = -1;
         for (int32_t slot = 0; slot < test.n_cache; ++slot) {
@@ -163,7 +181,7 @@ static plan_result make_reference(const test_case & test) {
             }
         }
         if (victim < 0) {
-            throw std::runtime_error(test.name + ": CPU reference could not select a victim");
+            continue;
         }
 
         const int32_t evicted = result.cache_to_expert[victim];
@@ -172,25 +190,31 @@ static plan_result make_reference(const test_case & test) {
             result.n_evictions++;
         }
         result.cache_to_expert[victim] = expert;
-        result.expert_order[result.n_resident + result.n_miss] = expert;
-        result.miss_expert[result.n_miss] = expert;
-        result.miss_slot[result.n_miss] = victim;
-        result.n_miss++;
+        result.expert_order[result.n_resident + result.n_fill] = expert;
+        result.fill_expert[result.n_fill] = expert;
+        result.fill_slot[result.n_fill] = victim;
+        result.n_fill++;
     }
 
-    for (uint32_t i = 0; i < result.n_miss; ++i) {
-        const int32_t expert = result.miss_expert[i];
-        const int32_t slot = result.miss_slot[i];
+    for (uint32_t i = 0; i < result.n_fill; ++i) {
+        const int32_t expert = result.fill_expert[i];
+        const int32_t slot = result.fill_slot[i];
         result.expert_to_cache[expert] = slot;
         result.cache_to_expert[slot] = expert;
     }
 
-    result.use_clock++;
+    if (!unique.empty()) {
+        result.use_clock++;
+    }
     for (int32_t expert : unique) {
-        result.last_used[result.expert_to_cache[expert]] = result.use_clock;
+        const int32_t slot = result.expert_to_cache[expert];
+        if (slot >= 0) {
+            result.last_used[slot] = result.use_clock;
+        }
     }
     for (int32_t i = 0; i < n_ids; ++i) {
         result.cache_ids[i] = result.expert_to_cache[test.ids[i]];
+        result.n_streamed += result.cache_ids[i] < 0;
     }
     return result;
 }
@@ -215,7 +239,8 @@ static void run_case(const test_case & test, hipStream_t stream) {
     const int32_t n_ids = test.n_tokens * test.n_expert_used;
     if ((int32_t) test.ids.size() != n_ids ||
             (int32_t) test.cache_to_expert.size() != test.n_cache ||
-            (int32_t) test.last_used.size() != test.n_cache) {
+            (int32_t) test.last_used.size() != test.n_cache ||
+            (!test.policy.empty() && (int32_t) test.policy.size() != test.n_tokens)) {
         throw std::runtime_error(test.name + ": invalid test data");
     }
 
@@ -223,12 +248,13 @@ static void run_case(const test_case & test, hipStream_t stream) {
     const std::vector<int32_t> initial_expert_to_cache = make_expert_to_cache(test);
 
     device_buffer<int32_t> ids(n_ids);
+    device_buffer<uint8_t> policy(test.n_tokens);
     device_buffer<int32_t> ids_src(n_ids);
     device_buffer<int32_t> ids_dst(n_ids);
     device_buffer<int32_t> expert_bounds(test.n_expert + 1);
     device_buffer<int32_t> expert_order(test.n_cache);
-    device_buffer<int32_t> miss_expert(test.n_cache);
-    device_buffer<int32_t> miss_slot(test.n_cache);
+    device_buffer<int32_t> fill_expert(test.n_cache);
+    device_buffer<int32_t> fill_slot(test.n_cache);
     device_buffer<int32_t> cache_ids(n_ids);
     device_buffer<int32_t> expert_to_cache(test.n_expert);
     device_buffer<int32_t> cache_to_expert(test.n_cache);
@@ -237,22 +263,27 @@ static void run_case(const test_case & test, hipStream_t stream) {
     device_buffer<uint32_t> n_active(1);
     device_buffer<uint32_t> n_resident(1);
     device_buffer<uint32_t> n_miss(1);
+    device_buffer<uint32_t> n_fill(1);
     device_buffer<uint32_t> n_evictions(1);
+    device_buffer<uint32_t> n_read_only(1);
+    device_buffer<uint32_t> n_streamed(1);
 
     ids.set(test.ids);
     expert_to_cache.set(initial_expert_to_cache);
     cache_to_expert.set(test.cache_to_expert);
     last_used.set(test.last_used);
     use_clock.set({ test.use_clock });
+    policy.set(test.policy.empty() ? std::vector<uint8_t>(test.n_tokens, 1) : test.policy);
 
     ggml_cuda_expert_plan plan = {};
     plan.ids_src = ids_src.ptr;
     plan.ids_dst = ids_dst.ptr;
     plan.expert_bounds = expert_bounds.ptr;
     plan.expert_order = expert_order.ptr;
-    plan.miss_expert = miss_expert.ptr;
-    plan.miss_slot = miss_slot.ptr;
+    plan.fill_expert = fill_expert.ptr;
+    plan.fill_slot = fill_slot.ptr;
     plan.cache_ids = cache_ids.ptr;
+    plan.policy = test.policy.empty() ? nullptr : policy.ptr;
     plan.expert_to_cache = expert_to_cache.ptr;
     plan.cache_to_expert = cache_to_expert.ptr;
     plan.last_used = last_used.ptr;
@@ -260,7 +291,10 @@ static void run_case(const test_case & test, hipStream_t stream) {
     plan.n_active = n_active.ptr;
     plan.n_resident = n_resident.ptr;
     plan.n_miss = n_miss.ptr;
+    plan.n_fill = n_fill.ptr;
     plan.n_evictions = n_evictions.ptr;
+    plan.n_read_only = n_read_only.ptr;
+    plan.n_streamed = n_streamed.ptr;
 
     ggml_cuda_launch_expert_plan(
         ids.ptr,
@@ -280,9 +314,9 @@ static void run_case(const test_case & test, hipStream_t stream) {
     expect_equal(test.name, "ids_src", ids_src.get(), expected.ids_src, n_ids);
     expect_equal(test.name, "ids_dst", ids_dst.get(), expected.ids_dst, n_ids);
     expect_equal(test.name, "expert_bounds", expert_bounds.get(), expected.expert_bounds, test.n_expert + 1);
-    expect_equal(test.name, "expert_order", expert_order.get(), expected.expert_order, expected.n_active);
-    expect_equal(test.name, "miss_expert", miss_expert.get(), expected.miss_expert, expected.n_miss);
-    expect_equal(test.name, "miss_slot", miss_slot.get(), expected.miss_slot, expected.n_miss);
+    expect_equal(test.name, "expert_order", expert_order.get(), expected.expert_order, expected.n_resident + expected.n_fill);
+    expect_equal(test.name, "fill_expert", fill_expert.get(), expected.fill_expert, expected.n_fill);
+    expect_equal(test.name, "fill_slot", fill_slot.get(), expected.fill_slot, expected.n_fill);
     expect_equal(test.name, "cache_ids", cache_ids.get(), expected.cache_ids, n_ids);
     expect_equal(test.name, "expert_to_cache", expert_to_cache.get(), expected.expert_to_cache, test.n_expert);
     expect_equal(test.name, "cache_to_expert", cache_to_expert.get(), expected.cache_to_expert, test.n_cache);
@@ -291,7 +325,10 @@ static void run_case(const test_case & test, hipStream_t stream) {
     expect_equal(test.name, "n_active", n_active.get(), std::vector<uint32_t>{ expected.n_active }, 1);
     expect_equal(test.name, "n_resident", n_resident.get(), std::vector<uint32_t>{ expected.n_resident }, 1);
     expect_equal(test.name, "n_miss", n_miss.get(), std::vector<uint32_t>{ expected.n_miss }, 1);
+    expect_equal(test.name, "n_fill", n_fill.get(), std::vector<uint32_t>{ expected.n_fill }, 1);
     expect_equal(test.name, "n_evictions", n_evictions.get(), std::vector<uint32_t>{ expected.n_evictions }, 1);
+    expect_equal(test.name, "n_read_only", n_read_only.get(), std::vector<uint32_t>{ expected.n_read_only }, 1);
+    expect_equal(test.name, "n_streamed", n_streamed.get(), std::vector<uint32_t>{ expected.n_streamed }, 1);
 
     std::printf("%s: OK\n", test.name.c_str());
 }
@@ -325,6 +362,7 @@ int main() {
             std::vector<int32_t>(8, -1),
             std::vector<uint64_t>(8, 0),
             0,
+            {},
         }, stream);
 
         run_case({
@@ -337,6 +375,7 @@ int main() {
             { 0, 8, 10, 12, 14, 15, 6, 7 },
             { 20, 10, 1, 2, 3, 4, 5, 6 },
             20,
+            {},
         }, stream);
 
         run_case({
@@ -349,6 +388,7 @@ int main() {
             identity_experts(16),
             std::vector<uint64_t>(16, 4),
             4,
+            {},
         }, stream);
 
         std::vector<int32_t> duplicate_ids;
@@ -365,6 +405,7 @@ int main() {
             std::vector<int32_t>(8, -1),
             std::vector<uint64_t>(8, 0),
             0,
+            {},
         }, stream);
 
         run_case({
@@ -377,6 +418,59 @@ int main() {
             std::vector<int32_t>(256, -1),
             std::vector<uint64_t>(256, 0),
             0,
+            {},
+        }, stream);
+
+        run_case({
+            "read-only",
+            8,
+            2,
+            2,
+            2,
+            { 0, 3, 1, 4 },
+            { 0, 1 },
+            { 10, 20 },
+            20,
+            { 0, 0 },
+        }, stream);
+
+        run_case({
+            "mixed-policy",
+            8,
+            2,
+            3,
+            2,
+            { 0, 2, 3, 1, 3, 0 },
+            { 0, 1 },
+            { 10, 20 },
+            20,
+            { 0, 1, 0 },
+        }, stream);
+
+        run_case({
+            "overflow",
+            8,
+            2,
+            2,
+            2,
+            { 0, 1, 2, 3 },
+            { -1, -1 },
+            { 0, 0 },
+            0,
+            { 1, 1 },
+        }, stream);
+
+        run_case({
+            "compatibility-overflow",
+            8,
+            2,
+            2,
+            2,
+            { 0, 1, 2, 3 },
+            { -1, -1 },
+            { 0, 0 },
+            0,
+            { 2, 2 },
         }, stream);
     } catch (const std::exception & error) {
         std::fprintf(stderr, "%s\n", error.what());

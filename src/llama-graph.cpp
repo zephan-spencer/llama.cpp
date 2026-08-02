@@ -18,6 +18,7 @@
 #include <cmath>
 #include <cstring>
 #include <numeric>
+#include <algorithm>
 #include <sstream>
 #include <string>
 #include <unordered_set>
@@ -1966,6 +1967,10 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
     cur = ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens);
 
+    const bool cache_update_only = ubatch.moe_cache_policy == nullptr || std::all_of(
+        ubatch.moe_cache_policy,
+        ubatch.moe_cache_policy + ubatch.n_tokens,
+        [](uint8_t policy) { return policy == LLAMA_MOE_CACHE_POLICY_UPDATE; });
     llama_moe_cache_binding cache_binding = {
         /*.up      =*/ up_exps,
         /*.gate    =*/ gate_exps,
@@ -1973,7 +1978,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         /*.gate_up =*/ gate_up_exps,
         /*.ids     =*/ selected_experts,
     };
-    if (moe_cache != nullptr) {
+    if (moe_cache != nullptr && cache_update_only) {
         cache_binding = moe_cache->bind(
             ctx0, sched, il, selected_experts, up_exps, gate_exps, down_exps, gate_up_exps);
         cb(cache_binding.ids, "ffn_moe_cache_ids", il);

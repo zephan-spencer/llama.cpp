@@ -50,6 +50,7 @@ struct llama_ubatch {
     llama_seq_id *  seq_id_unq; // [n_seqs_unq]       | s   | seq_id
     int32_t      *  seq_idx;    // [LLAMA_MAX_SEQ]    | -   | seq_idx
     int8_t       *  output;     // [n_tokens]         | i   | -
+    uint8_t      *  moe_cache_policy; // [n_tokens]    | i   | llama_moe_cache_policy
 
     struct data_t {
         std::vector<llama_token>    token;
@@ -60,6 +61,7 @@ struct llama_ubatch {
         std::vector<llama_seq_id>   seq_id_unq;
         std::vector<int32_t>        seq_idx;
         std::vector<int8_t>         output;
+        std::vector<uint8_t>        moe_cache_policy;
 
         std::vector<llama_seq_id> seq_id_data;
     };

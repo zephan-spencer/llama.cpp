@@ -56,6 +56,7 @@ struct batch_builder {
     std::vector<llama_pos> pos;
     std::vector<int32_t>   n_seq_id;
     std::vector<int8_t>    logits;
+    std::vector<uint8_t>   moe_cache_policy;
 
     std::vector<std::vector<llama_seq_id>> seq;
     std::vector<llama_seq_id *>            seq_ptr;
@@ -72,6 +73,7 @@ struct batch_builder {
         n_seq_id.push_back((int32_t) seq_ids.size());
         seq.emplace_back(seq_ids);
         logits.push_back(output ? 1 : 0);
+        moe_cache_policy.push_back(i & 1 ? LLAMA_MOE_CACHE_POLICY_UPDATE : LLAMA_MOE_CACHE_POLICY_READ_ONLY);
     }
 
     llama_batch make(bool with_pos = true, bool with_seq = true, bool with_logits = true) {
@@ -88,6 +90,7 @@ struct batch_builder {
         res.n_seq_id = with_seq    ? n_seq_id.data() : nullptr;
         res.seq_id   = with_seq    ? seq_ptr.data()  : nullptr;
         res.logits   = with_logits ? logits.data()   : nullptr;
+        res.moe_cache_policy = moe_cache_policy.data();
 
         return res;
     }
@@ -301,18 +304,22 @@ static void test_split(testing & t) {
         t.assert_equal(1u, ub.n_seqs_unq);
         t.assert_equal(0, ub.seq_id_unq[0]);
         t.assert_equal(0, ub.seq_idx[0]);
+        t.assert_true(ub.moe_cache_policy != nullptr);
         for (int i = 0; i < 2; ++i) {
             t.assert_equal(i, ub.pos[i]);
             t.assert_equal(1, ub.n_seq_id[i]);
             t.assert_equal(0, ub.seq_id[i][0]);
             t.assert_equal(100.0f*i, ub.embd[i*bb.n_embd]);
             t.assert_equal(100.0f*i + 1, ub.embd[i*bb.n_embd + 1]);
+            t.assert_equal(i & 1 ? LLAMA_MOE_CACHE_POLICY_UPDATE : LLAMA_MOE_CACHE_POLICY_READ_ONLY, ub.moe_cache_policy[i]);
         }
 
         ub = ba.split_simple(2);
         t.assert_equal(2u, ub.n_tokens);
         t.assert_equal(2, ub.pos[0]);
         t.assert_equal(3, ub.pos[1]);
+        t.assert_equal(LLAMA_MOE_CACHE_POLICY_READ_ONLY, ub.moe_cache_policy[0]);
+        t.assert_equal(LLAMA_MOE_CACHE_POLICY_UPDATE, ub.moe_cache_policy[1]);
 
         ub = ba.split_simple(2);
         t.assert_equal(1u, ub.n_tokens);

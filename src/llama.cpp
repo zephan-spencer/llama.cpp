@@ -342,10 +342,11 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
                     "MoE expert cache: capacity must be at least the number of experts used per token (" +
                     std::to_string(model->hparams.n_expert_used) + ")");
             }
-            if (params.n_moe_cache_experts > model->hparams.n_expert) {
+            if (params.n_moe_cache_experts >= model->hparams.n_expert) {
                 throw std::runtime_error(
-                    "MoE expert cache: capacity exceeds the model expert count (" +
-                    std::to_string(model->hparams.n_expert) + ")");
+                    "MoE expert cache: capacity must be smaller than the model expert count (" +
+                    std::to_string(model->hparams.n_expert) +
+                    "); omit --moe-cache-experts when all experts fit in VRAM");
             }
             if (model->n_devices() != 1) {
                 throw std::runtime_error("MoE expert cache: exactly one GPU device is required");

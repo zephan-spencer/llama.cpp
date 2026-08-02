@@ -2628,7 +2628,8 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_env("LLAMA_ARG_N_CPU_MOE"));
     add_opt(common_arg(
         {"--moe-cache-experts"}, "N",
-        "keep routed expert weights in host memory and cache N experts per MoE layer on one GPU (default: 0)",
+        "keep routed expert weights in host memory and cache N experts per MoE layer on one GPU; "
+        "N must be smaller than the model's expert count (default: 0)",
         [](common_params & params, int value) {
             if (value < 0) {
                 throw std::invalid_argument("invalid value");

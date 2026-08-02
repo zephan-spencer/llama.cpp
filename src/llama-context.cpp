@@ -424,7 +424,8 @@ llama_context::llama_context(
                 model, backend_ptrs, model.n_moe_cache_experts());
 
             const uint32_t n_cacheable_tokens = model.n_moe_cache_experts() / hparams.n_expert_used;
-            if (cparams.n_ubatch > n_cacheable_tokens) {
+            if (model.n_moe_cache_experts() < hparams.n_expert &&
+                    cparams.n_ubatch > n_cacheable_tokens) {
                 LLAMA_LOG_INFO(
                     "%s: MoE expert cache handles graphs of up to %u tokens; larger graphs use streamed weights (n_ubatch = %u)\n",
                     __func__, n_cacheable_tokens, cparams.n_ubatch);

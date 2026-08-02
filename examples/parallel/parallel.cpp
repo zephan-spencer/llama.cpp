@@ -400,6 +400,7 @@ int main(int argc, char ** argv) {
                 batch.n_seq_id + i,
                 batch.seq_id   + i,
                 batch.logits   + i,
+                batch.moe_cache_policy ? batch.moe_cache_policy + i : nullptr,
             };
 
             const int ret = llama_decode(ctx, batch_view);

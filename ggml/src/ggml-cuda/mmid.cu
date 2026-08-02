@@ -147,7 +147,8 @@ static __global__ void expert_plan_cache(
         ggml_cuda_expert_plan plan,
         int64_t n_ids,
         int n_experts,
-        int n_cache) {
+        int n_cache,
+        int n_expert_used) {
     extern __shared__ int32_t scratch[];
 
     int32_t * requested = scratch;
@@ -162,32 +163,50 @@ static __global__ void expert_plan_cache(
         return;
     }
 
+    const bool compatibility = plan.policy != nullptr && plan.policy[0] == 2;
     int32_t n_active = 0;
+    int32_t n_read_only = 0;
     for (int64_t i = 0; i < n_ids; ++i) {
         const int32_t expert = ids[i];
         assert(expert >= 0 && expert < n_experts);
+        const bool update = compatibility || plan.policy == nullptr || plan.policy[i / n_expert_used] == 1;
+        n_read_only += !update;
+        if (!update) {
+            continue;
+        }
         if (!requested[expert]) {
             requested[expert] = 1;
             unique[n_active++] = expert;
         }
     }
-    assert(n_active <= n_cache);
+    if (compatibility && n_active > n_cache) {
+        for (int32_t expert = 0; expert < n_experts; ++expert) {
+            requested[expert] = 0;
+        }
+        n_read_only = n_ids;
+        n_active = 0;
+    }
 
     int32_t n_resident = 0;
     for (int32_t i = 0; i < n_active; ++i) {
         const int32_t expert = unique[i];
         if (plan.expert_to_cache[expert] >= 0) {
-            plan.expert_order[n_resident++] = expert;
+            if (plan.expert_order != nullptr) {
+                plan.expert_order[n_resident] = expert;
+            }
+            n_resident++;
         }
     }
 
     int32_t n_miss = 0;
+    int32_t n_fill = 0;
     int32_t n_evictions = 0;
     for (int32_t i = 0; i < n_active; ++i) {
         const int32_t expert = unique[i];
         if (plan.expert_to_cache[expert] >= 0) {
             continue;
         }
+        n_miss++;
 
         int32_t victim = -1;
         for (int32_t slot = 0; slot < n_cache; ++slot) {
@@ -207,7 +226,9 @@ static __global__ void expert_plan_cache(
                 }
             }
         }
-        assert(victim >= 0);
+        if (victim < 0) {
+            continue;
+        }
 
         const int32_t evicted = plan.cache_to_expert[victim];
         if (evicted >= 0) {
@@ -216,36 +237,43 @@ static __global__ void expert_plan_cache(
         }
 
         plan.cache_to_expert[victim] = expert;
-        plan.expert_order[n_resident + n_miss] = expert;
-        plan.miss_expert[n_miss] = expert;
-        plan.miss_slot[n_miss] = victim;
-        n_miss++;
+        if (plan.expert_order != nullptr) {
+            plan.expert_order[n_resident + n_fill] = expert;
+        }
+        plan.fill_expert[n_fill] = expert;
+        plan.fill_slot[n_fill] = victim;
+        n_fill++;
     }
 
-    for (int32_t i = 0; i < n_miss; ++i) {
-        const int32_t expert = plan.miss_expert[i];
-        const int32_t slot = plan.miss_slot[i];
+    for (int32_t i = 0; i < n_fill; ++i) {
+        const int32_t expert = plan.fill_expert[i];
+        const int32_t slot = plan.fill_slot[i];
         plan.expert_to_cache[expert] = slot;
         plan.cache_to_expert[slot] = expert;
     }
 
-    const uint64_t use_clock = ++*plan.use_clock;
+    const uint64_t use_clock = n_active == 0 ? *plan.use_clock : ++*plan.use_clock;
     for (int32_t i = 0; i < n_active; ++i) {
         const int32_t slot = plan.expert_to_cache[unique[i]];
-        assert(slot >= 0);
-        plan.last_used[slot] = use_clock;
+        if (slot >= 0) {
+            plan.last_used[slot] = use_clock;
+        }
     }
 
+    int32_t n_streamed = 0;
     for (int64_t i = 0; i < n_ids; ++i) {
         const int32_t slot = plan.expert_to_cache[ids[i]];
-        assert(slot >= 0);
         plan.cache_ids[i] = slot;
+        n_streamed += slot < 0;
     }
 
     *plan.n_active = n_active;
     *plan.n_resident = n_resident;
     *plan.n_miss = n_miss;
+    *plan.n_fill = n_fill;
     *plan.n_evictions = n_evictions;
+    *plan.n_read_only = n_read_only;
+    *plan.n_streamed = n_streamed;
 }
 
 void ggml_cuda_launch_expert_plan(
@@ -288,13 +316,25 @@ void ggml_cuda_launch_expert_plan(
             break;
     }
 
-    if (plan.expert_order == nullptr) {
-        return;
+    if (plan.expert_order != nullptr) {
+        ggml_cuda_launch_expert_cache_plan(
+            ids, plan, n_experts, n_tokens, n_expert_used, n_cache, stream);
     }
+}
+
+void ggml_cuda_launch_expert_cache_plan(
+        const int32_t * ids,
+        const ggml_cuda_expert_plan & plan,
+        const int n_experts,
+        const int n_tokens,
+        const int n_expert_used,
+        const int n_cache,
+        cudaStream_t stream) {
+    GGML_ASSERT(ids != nullptr);
 
     GGML_ASSERT(n_cache > 0 && n_cache <= n_experts);
-    GGML_ASSERT(plan.miss_expert != nullptr);
-    GGML_ASSERT(plan.miss_slot != nullptr);
+    GGML_ASSERT(plan.fill_expert != nullptr);
+    GGML_ASSERT(plan.fill_slot != nullptr);
     GGML_ASSERT(plan.cache_ids != nullptr);
     GGML_ASSERT(plan.expert_to_cache != nullptr);
     GGML_ASSERT(plan.cache_to_expert != nullptr);
@@ -303,7 +343,10 @@ void ggml_cuda_launch_expert_plan(
     GGML_ASSERT(plan.n_active != nullptr);
     GGML_ASSERT(plan.n_resident != nullptr);
     GGML_ASSERT(plan.n_miss != nullptr);
+    GGML_ASSERT(plan.n_fill != nullptr);
     GGML_ASSERT(plan.n_evictions != nullptr);
+    GGML_ASSERT(plan.n_read_only != nullptr);
+    GGML_ASSERT(plan.n_streamed != nullptr);
 
     const size_t shared_size = 2 * n_experts * sizeof(int32_t);
     expert_plan_cache<<<1, 256, shared_size, stream>>>(
@@ -311,5 +354,6 @@ void ggml_cuda_launch_expert_plan(
         plan,
         (int64_t) n_tokens * n_expert_used,
         n_experts,
-        n_cache);
+        n_cache,
+        n_expert_used);
 }

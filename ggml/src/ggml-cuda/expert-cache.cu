@@ -20,12 +20,10 @@ struct expert_cache_params {
     uint32_t n_expert;
     uint32_t n_cache;
     uint32_t n_weights;
+    uint32_t n_routes;
     uint64_t expert_to_cache_offset;
     uint64_t cache_to_expert_offset;
     uint64_t last_used_offset;
-    uint64_t route_indices_offset;
-    uint64_t expert_bounds_offset;
-    uint64_t expert_order_offset;
     uint64_t fill_expert_offset;
     uint64_t fill_slot_offset;
 };
@@ -62,8 +60,13 @@ static __global__ void expert_cache_record_plan_kernel(
     }
 
     header->stats.resolve_calls++;
+    header->stats.update_touches += header->n_active;
+    header->stats.read_only_touches += header->n_read_only;
+    header->stats.resident_routes += params.n_routes;
+    header->stats.resident_routes -= header->n_streamed;
+    header->stats.streamed_routes += header->n_streamed;
     header->stats.cache_hits += header->n_resident;
-    header->stats.cache_misses += header->n_fills;
+    header->stats.cache_misses += header->n_misses;
     header->stats.evictions += header->n_evictions;
     header->stats.h2d_bytes += header->n_fills * bytes_per_fill;
     header->copy_blocks_done = 0;
@@ -116,7 +119,8 @@ static __global__ void expert_cache_copy_kernel(
 
 bool ggml_cuda_expert_cache_supported(const ggml_tensor * dst) {
     ggml_backend_cuda_expert_cache_desc * desc = expert_cache_desc(dst);
-    if (desc == nullptr || desc->n_weights == 0 || desc->n_weights > GGML_CUDA_EXPERT_CACHE_MAX_WEIGHTS) {
+    if (desc == nullptr || desc->n_weights == 0 ||
+            desc->n_weights > GGML_CUDA_EXPERT_CACHE_MAX_WEIGHTS) {
         return false;
     }
     if (dst->type != GGML_TYPE_I32 || dst->src[0] == nullptr || dst->src[0]->type != GGML_TYPE_I32 || !ggml_is_contiguous(dst->src[0])) {
@@ -142,20 +146,38 @@ bool ggml_cuda_expert_cache_supported(const ggml_tensor * dst) {
     return true;
 }
 
+static void expert_cache_prepare_clock(ggml_backend_cuda_expert_cache_desc * desc) {
+    if (desc->wall_clock_hz != 0) {
+        return;
+    }
+
+    int device = 0;
+    int wall_clock_khz = 0;
+    hipError_t error = hipGetDevice(&device);
+    if (error != hipSuccess) {
+        GGML_ABORT("failed to get expert cache device: %s", hipGetErrorString(error));
+    }
+    error = hipDeviceGetAttribute(&wall_clock_khz, hipDeviceAttributeWallClockRate, device);
+    if (error != hipSuccess) {
+        GGML_ABORT("failed to get expert cache wall clock: %s", hipGetErrorString(error));
+    }
+    desc->wall_clock_hz = (uint64_t) wall_clock_khz * 1000;
+}
+
 void ggml_cuda_expert_cache(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_backend_cuda_expert_cache_desc * desc = expert_cache_desc(dst);
     GGML_ASSERT(desc != nullptr);
+
+    expert_cache_prepare_clock(desc);
 
     expert_cache_params params = {};
     params.n_expert = desc->n_expert;
     params.n_cache = desc->n_cache;
     params.n_weights = desc->n_weights;
+    params.n_routes = ggml_nelements(dst->src[0]);
     params.expert_to_cache_offset = desc->expert_to_cache_offset;
     params.cache_to_expert_offset = desc->cache_to_expert_offset;
     params.last_used_offset = desc->last_used_offset;
-    params.route_indices_offset = desc->route_indices_offset;
-    params.expert_bounds_offset = desc->expert_bounds_offset;
-    params.expert_order_offset = desc->expert_order_offset;
     params.fill_expert_offset = desc->fill_expert_offset;
     params.fill_slot_offset = desc->fill_slot_offset;
 
@@ -177,29 +199,12 @@ void ggml_cuda_expert_cache(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
         };
     }
 
-    if (desc->wall_clock_hz == 0) {
-        int device = 0;
-        int wall_clock_khz = 0;
-        hipError_t error = hipGetDevice(&device);
-        if (error != hipSuccess) {
-            GGML_ABORT("failed to get expert cache device: %s", hipGetErrorString(error));
-        }
-        error = hipDeviceGetAttribute(&wall_clock_khz, hipDeviceAttributeWallClockRate, device);
-        if (error != hipSuccess) {
-            GGML_ABORT("failed to get expert cache wall clock: %s", hipGetErrorString(error));
-        }
-        desc->wall_clock_hz = (uint64_t) wall_clock_khz * 1000;
-    }
-
     uint8_t * state_data = static_cast<uint8_t *>(dst->src[1]->data);
     auto * header = reinterpret_cast<ggml_backend_cuda_expert_cache_state *>(state_data);
 
     ggml_cuda_expert_plan plan = {};
-    plan.ids_dst = reinterpret_cast<int32_t *>(state_data + params.route_indices_offset);
-    plan.expert_bounds = reinterpret_cast<int32_t *>(state_data + params.expert_bounds_offset);
-    plan.expert_order = reinterpret_cast<int32_t *>(state_data + params.expert_order_offset);
-    plan.miss_expert = reinterpret_cast<int32_t *>(state_data + params.fill_expert_offset);
-    plan.miss_slot = reinterpret_cast<int32_t *>(state_data + params.fill_slot_offset);
+    plan.fill_expert = reinterpret_cast<int32_t *>(state_data + params.fill_expert_offset);
+    plan.fill_slot = reinterpret_cast<int32_t *>(state_data + params.fill_slot_offset);
     plan.cache_ids = static_cast<int32_t *>(dst->data);
     plan.expert_to_cache = reinterpret_cast<int32_t *>(state_data + params.expert_to_cache_offset);
     plan.cache_to_expert = reinterpret_cast<int32_t *>(state_data + params.cache_to_expert_offset);
@@ -207,22 +212,20 @@ void ggml_cuda_expert_cache(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
     plan.use_clock = &header->use_clock;
     plan.n_active = &header->n_active;
     plan.n_resident = &header->n_resident;
-    plan.n_miss = &header->n_fills;
+    plan.n_miss = &header->n_misses;
+    plan.n_fill = &header->n_fills;
     plan.n_evictions = &header->n_evictions;
+    plan.n_read_only = &header->n_read_only;
+    plan.n_streamed = &header->n_streamed;
 
     const int n_expert_used = dst->src[0]->ne[0];
     const int n_tokens = ggml_nelements(dst->src[0]) / n_expert_used;
-    const int si1 = dst->src[0]->nb[1] / ggml_element_size(dst->src[0]);
-    ggml_cuda_launch_expert_plan(
+    ggml_cuda_launch_expert_cache_plan(
         static_cast<const int32_t *>(dst->src[0]->data),
         plan,
         desc->n_expert,
         n_tokens,
         n_expert_used,
-        n_expert_used,
-        si1,
-        n_expert_used,
-        /*write_inverse =*/ false,
         desc->n_cache,
         ctx.stream());
     CUDA_CHECK(cudaGetLastError());
