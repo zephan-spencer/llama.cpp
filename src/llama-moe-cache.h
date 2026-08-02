@@ -31,6 +31,7 @@ public:
             ggml_backend_sched_t sched,
             int il,
             ggml_tensor * ids,
+            ggml_tensor * policy,
             ggml_tensor * up,
             ggml_tensor * gate,
             ggml_tensor * down,

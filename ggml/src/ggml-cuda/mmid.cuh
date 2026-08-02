@@ -1,5 +1,16 @@
 #pragma once
 
+#include <cstdint>
+
+struct ggml_cuda_expert_source_view {
+    const int32_t * selectors;
+    int64_t selector_stride;
+    uint32_t selector_width;
+    const char * host_data;
+    int64_t host_stride;
+    uint32_t n_expert;
+};
+
 struct ggml_cuda_expert_plan {
     int32_t * ids_src;
     int32_t * ids_dst;
@@ -23,6 +34,7 @@ struct ggml_cuda_expert_plan {
     uint32_t * n_evictions;
     uint32_t * n_read_only;
     uint32_t * n_streamed;
+    uint32_t * n_host_experts;
 };
 
 void ggml_cuda_launch_expert_plan(

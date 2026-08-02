@@ -69,6 +69,7 @@ static __global__ void expert_cache_record_plan_kernel(
     header->stats.cache_misses += header->n_misses;
     header->stats.evictions += header->n_evictions;
     header->stats.h2d_bytes += header->n_fills * bytes_per_fill;
+    header->stats.host_expert_bytes += header->n_host_experts * bytes_per_fill;
     header->copy_blocks_done = 0;
     if (header->n_fills > 0) {
         header->fill_start_ticks = wall_clock64();
@@ -132,11 +133,21 @@ bool ggml_cuda_expert_cache_supported(const ggml_tensor * dst) {
     if (desc->n_expert == 0 || desc->n_cache == 0 || desc->n_cache > desc->n_expert) {
         return false;
     }
-    if (ggml_nelements(dst->src[0]) > desc->n_cache || ggml_nbytes(dst->src[1]) < desc->state_size) {
+    int state_index = 1;
+    if (dst->src[2] != nullptr && dst->src[2]->type == GGML_TYPE_I8 &&
+            ggml_is_contiguous(dst->src[2]) && dst->src[2]->ne[0] == (int64_t) desc->state_size &&
+            dst->src[2]->ne[1] == 1 && dst->src[2]->ne[2] == 1 && dst->src[2]->ne[3] == 1) {
+        state_index = 2;
+        if (dst->src[1]->ne[0] != dst->src[0]->ne[1] || dst->src[1]->ne[1] != 1 ||
+                dst->src[1]->ne[2] != 1 || dst->src[1]->ne[3] != 1) {
+            return false;
+        }
+    }
+    if (dst->src[state_index] == nullptr || ggml_nbytes(dst->src[state_index]) < desc->state_size) {
         return false;
     }
     for (uint32_t i = 0; i < desc->n_weights; ++i) {
-        if (dst->src[2 + i] == nullptr ||
+        if (dst->src[state_index + 1 + i] == nullptr ||
                 desc->weights[i].host_data == nullptr ||
                 desc->weights[i].expert_size == 0 ||
                 desc->weights[i].expert_size % sizeof(uint4) != 0) {
@@ -170,6 +181,15 @@ void ggml_cuda_expert_cache(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
 
     expert_cache_prepare_clock(desc);
 
+    int state_index = 1;
+    const ggml_tensor * policy_src = nullptr;
+    if (dst->src[2] != nullptr && dst->src[2]->type == GGML_TYPE_I8 &&
+            dst->src[2]->ne[0] == (int64_t) desc->state_size && dst->src[2]->ne[1] == 1 &&
+            dst->src[2]->ne[2] == 1 && dst->src[2]->ne[3] == 1) {
+        state_index = 2;
+        policy_src = dst->src[1];
+    }
+
     expert_cache_params params = {};
     params.n_expert = desc->n_expert;
     params.n_cache = desc->n_cache;
@@ -194,12 +214,12 @@ void ggml_cuda_expert_cache(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
 
         params.weights[i] = {
             static_cast<const uint8_t *>(desc->weights[i].device_data) + desc->weights[i].host_offset,
-            static_cast<uint8_t *>(dst->src[2 + i]->data),
+            static_cast<uint8_t *>(dst->src[state_index + 1 + i]->data),
             desc->weights[i].expert_size,
         };
     }
 
-    uint8_t * state_data = static_cast<uint8_t *>(dst->src[1]->data);
+    uint8_t * state_data = static_cast<uint8_t *>(dst->src[state_index]->data);
     auto * header = reinterpret_cast<ggml_backend_cuda_expert_cache_state *>(state_data);
 
     ggml_cuda_expert_plan plan = {};
@@ -217,6 +237,8 @@ void ggml_cuda_expert_cache(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
     plan.n_evictions = &header->n_evictions;
     plan.n_read_only = &header->n_read_only;
     plan.n_streamed = &header->n_streamed;
+    plan.n_host_experts = &header->n_host_experts;
+    plan.policy = policy_src != nullptr ? static_cast<const uint8_t *>(policy_src->data) : nullptr;
 
     const int n_expert_used = dst->src[0]->ne[0];
     const int n_tokens = ggml_nelements(dst->src[0]) / n_expert_used;

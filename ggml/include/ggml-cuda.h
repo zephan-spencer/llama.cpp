@@ -20,7 +20,8 @@ extern "C" {
 #define GGML_CUDA_MAX_DEVICES       16
 #define GGML_CUDA_EXPERT_CACHE_MAX_WEIGHTS 4
 #define GGML_CUDA_EXPERT_CACHE_MAGIC 0x4558504341434845ULL
-#define GGML_CUDA_EXPERT_CACHE_VERSION 4
+#define GGML_CUDA_EXPERT_CACHE_VERSION 5
+#define GGML_CUDA_EXPERT_SOURCE_MAGIC 0x4558505352430001ULL
 
 struct ggml_backend_cuda_expert_cache_stats {
     uint64_t resolve_calls;
@@ -32,6 +33,7 @@ struct ggml_backend_cuda_expert_cache_stats {
     uint64_t cache_misses;
     uint64_t evictions;
     uint64_t h2d_bytes;
+    uint64_t host_expert_bytes;
     uint64_t fill_ticks;
 };
 
@@ -46,6 +48,7 @@ struct ggml_backend_cuda_expert_cache_state {
     uint32_t n_evictions;
     uint32_t n_read_only;
     uint32_t n_streamed;
+    uint32_t n_host_experts;
     uint32_t copy_blocks_done;
 };
 
@@ -54,6 +57,12 @@ struct ggml_backend_cuda_expert_cache_weight {
     void * device_data;
     uint64_t host_offset;
     uint64_t expert_size;
+};
+
+struct ggml_backend_cuda_expert_source {
+    uint64_t magic;
+    uint32_t n_expert;
+    const struct ggml_backend_cuda_expert_cache_weight * weight;
 };
 
 struct ggml_backend_cuda_expert_cache_desc {

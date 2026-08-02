@@ -29,6 +29,7 @@
 #include "ggml-cuda/getrows.cuh"
 #include "ggml-cuda/im2col.cuh"
 #include "ggml-cuda/mmf.cuh"
+#include "ggml-cuda/mmid.cuh"
 #include "ggml-cuda/mmq.cuh"
 #include "ggml-cuda/mmvf.cuh"
 #include "ggml-cuda/mmvq.cuh"
@@ -1660,6 +1661,31 @@ static void ggml_cuda_mul_mat_cublas(ggml_backend_cuda_context & ctx, const ggml
     }
 }
 
+static bool ggml_cuda_get_expert_source_view(
+        const ggml_tensor * src0, const ggml_tensor * ids_source, ggml_cuda_expert_source_view & view) {
+    if (ids_source == nullptr) {
+        return false;
+    }
+
+    GGML_ASSERT(ids_source->type == GGML_TYPE_I32);
+    GGML_ASSERT(src0->extra != nullptr);
+    const auto * source = static_cast<const ggml_backend_cuda_expert_source *>(src0->extra);
+    GGML_ASSERT(source->magic == GGML_CUDA_EXPERT_SOURCE_MAGIC);
+    GGML_ASSERT(source->weight != nullptr);
+    GGML_ASSERT(source->weight->device_data != nullptr);
+    GGML_ASSERT(source->n_expert > 0);
+
+    const size_t type_size = ggml_type_size(src0->type);
+    GGML_ASSERT(source->weight->expert_size % type_size == 0);
+    view.selectors = static_cast<const int32_t *>(ids_source->data);
+    view.selector_stride = ids_source->nb[1] / ggml_type_size(ids_source->type);
+    view.selector_width = ids_source->ne[0];
+    view.host_data = static_cast<const char *>(source->weight->device_data) + source->weight->host_offset;
+    view.host_stride = source->weight->expert_size / type_size;
+    view.n_expert = source->n_expert;
+    return true;
+}
+
 static bool ggml_cuda_should_fuse_mul_mat(const ggml_tensor * ffn_up,
                                           const ggml_tensor * ffn_gate,
                                           const ggml_tensor * glu,
@@ -1683,6 +1709,10 @@ static bool ggml_cuda_should_fuse_mul_mat(const ggml_tensor * ffn_up,
     GGML_ASSERT(ffn_up && ffn_gate && glu);
 
     if (!is_mul_mat && !is_mul_mat_id) {
+        return false;
+    }
+
+    if (is_mul_mat_id && (ffn_up->src[3] != nullptr || ffn_gate->src[3] != nullptr)) {
         return false;
     }
 
@@ -1856,6 +1886,14 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
     const ggml_tensor * ids  = dst->src[2];
+    const ggml_tensor * ids_source = dst->src[3];
+    ggml_cuda_expert_source_view source_view = {};
+    const ggml_cuda_expert_source_view * source =
+        ggml_cuda_get_expert_source_view(src0, ids_source, source_view) ? &source_view : nullptr;
+
+    if (source != nullptr) {
+        GGML_ASSERT(ggml_is_quantized(src0->type));
+    }
 
     GGML_ASSERT(src1->type == GGML_TYPE_F32);
     GGML_ASSERT(dst->type  == GGML_TYPE_F32);
@@ -1871,7 +1909,7 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
             if (ggml_is_quantized(src0->type)) {
                 const int mmvq_mmid_max = get_mmvq_mmid_max_batch(src0->type, cc);
                 if (ne2 <= mmvq_mmid_max) {
-                    ggml_cuda_mul_mat_vec_q(ctx, src0, src1, ids, dst);
+                    ggml_cuda_mul_mat_vec_q(ctx, src0, src1, ids, dst, nullptr, source);
                     return;
                 }
             } else {
@@ -1882,8 +1920,8 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
             }
         }
 
-        if (ggml_cuda_should_use_mmq(src0->type, cc, ne12, /*n_experts=*/ne02)) {
-            ggml_cuda_mul_mat_q(ctx, src0, src1, ids, dst);
+        if (source != nullptr || ggml_cuda_should_use_mmq(src0->type, cc, ne12, /*n_experts=*/ne02)) {
+            ggml_cuda_mul_mat_q(ctx, src0, src1, ids, dst, source);
             return;
         }
 

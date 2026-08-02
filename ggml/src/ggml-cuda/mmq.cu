@@ -79,7 +79,8 @@ static void ggml_cuda_mul_mat_q_switch_type(ggml_backend_cuda_context & ctx, con
 }
 
 void ggml_cuda_mul_mat_q(
-        ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst) {
+        ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
+        const ggml_cuda_expert_source_view * source) {
     GGML_ASSERT(        src1->type == GGML_TYPE_F32);
     GGML_ASSERT(        dst->type  == GGML_TYPE_F32);
     GGML_ASSERT(!ids || ids->type  == GGML_TYPE_I32); // Optional, used for batched GGML_MUL_MAT_ID.
@@ -162,7 +163,7 @@ void ggml_cuda_mul_mat_q(
         const int64_t s13 = ne12*s12;
 
         const mmq_args args = {
-            src0_d, src0->type, (const int *) src1_q8_1.ptr, nullptr, nullptr, dst_d,
+            src0_d, src0->type, (const int *) src1_q8_1.ptr, nullptr, nullptr, nullptr, nullptr, 0, 0, 0, dst_d,
             src0->type == GGML_TYPE_NVFP4 && use_native_fp4 ? src1_scale.ptr : nullptr,
             ne00, ne01, ne1, s01, ne11, s1,
             ne02, ne12, s02, s12, s2,
@@ -182,7 +183,8 @@ void ggml_cuda_mul_mat_q(
 
     ggml_cuda_pool_alloc<int32_t> ids_src1(ctx.pool(), ne_get_rows);
     ggml_cuda_pool_alloc<int32_t> ids_dst(ctx.pool(), ne_get_rows);
-    ggml_cuda_pool_alloc<int32_t> expert_bounds(ctx.pool(), ne02 + 1);
+    const int64_t n_experts = source != nullptr ? source->n_expert : ne02;
+    ggml_cuda_pool_alloc<int32_t> expert_bounds(ctx.pool(), n_experts + 1);
 
     // gate/up activations are broadcast across experts (ne11 == 1): quantize each token once and
     // scatter to its slots. ids_src1 then holds the inverse map (token slot -> compact row).
@@ -198,7 +200,7 @@ void ggml_cuda_mul_mat_q(
         plan.ids_dst = ids_dst.get();
         plan.expert_bounds = expert_bounds.get();
         ggml_cuda_launch_expert_plan((const int32_t *) ids->data, plan,
-            ne02, ne12, n_expert_used, ne11, si1, sis1, /*write_inverse =*/ dedup_bcast, /*n_cache =*/ 0, stream);
+            n_experts, ne12, n_expert_used, ne11, si1, sis1, /*write_inverse =*/ dedup_bcast, /*n_cache =*/ 0, stream);
         CUDA_CHECK(cudaGetLastError());
     }
 
@@ -246,12 +248,18 @@ void ggml_cuda_mul_mat_q(
 
     // Note that ne02 is used instead of ne12 because the number of y channels determines the z dimension of the CUDA grid.
     const mmq_args args = {
-        src0_d, src0->type, (const int *) src1_q8_1.get(), ids_dst.get(), expert_bounds.get(), dst_d,
+        src0_d, src0->type, (const int *) src1_q8_1.get(), ids_dst.get(), expert_bounds.get(),
+        source != nullptr ? source->selectors : nullptr,
+        source != nullptr ? source->host_data : nullptr,
+        source != nullptr ? source->host_stride : 0,
+        source != nullptr ? source->selector_stride : 0,
+        source != nullptr ? source->selector_width : 0,
+        dst_d,
         src1_scale.ptr,
         ne00, ne01, ne_get_rows, s01, ne_get_rows, s1,
-        ne02, ne02, s02, s12, s2,
+        n_experts, n_experts, s02, s12, s2,
         ne03, ne13, s03, s13, s3,
-        ne12};
+        source != nullptr ? ne_get_rows : ne12};
 
     ggml_cuda_mul_mat_q_switch_type(ctx, args, stream);
 }

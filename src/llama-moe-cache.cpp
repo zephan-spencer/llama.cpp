@@ -36,6 +36,7 @@ struct llama_moe_expert_cache::impl {
         ggml_tensor * state = nullptr;
 
         std::vector<weight> weights;
+        std::vector<ggml_backend_cuda_expert_source> sources;
         std::vector<int32_t> expert_to_cache;
         std::vector<int32_t> cache_to_expert;
         std::vector<uint64_t> last_used;
@@ -157,6 +158,15 @@ struct llama_moe_expert_cache::impl {
             ggml_format_name(slots, "%s#moe_cache", source->name);
             result->weights.push_back({ source, slots });
         }
+        result->sources.resize(result->weights.size());
+        for (size_t i = 0; i < result->sources.size(); ++i) {
+            result->sources[i] = {
+                GGML_CUDA_EXPERT_SOURCE_MAGIC,
+                (uint32_t) result->n_expert,
+                nullptr,
+            };
+            result->weights[i].slots->extra = &result->sources[i];
+        }
 
         size_t state_offset = sizeof(ggml_backend_cuda_expert_cache_state);
         if (needs_planner_state) {
@@ -214,6 +224,10 @@ struct llama_moe_expert_cache::impl {
         result->device_desc.n_expert = n_expert;
         result->device_desc.n_cache = n_cache_experts;
         result->device_desc.n_weights = result->weights.size();
+
+        for (size_t i = 0; i < result->sources.size(); ++i) {
+            result->sources[i].weight = &result->device_desc.weights[i];
+        }
 
         if (!model.hparams.no_alloc && needs_planner_state) {
             ggml_backend_buffer_type_t host_buft = ggml_backend_dev_host_buffer_type(device);
@@ -291,6 +305,7 @@ struct llama_moe_expert_cache::impl {
         uint64_t total_cache_misses = 0;
         uint64_t total_evictions = 0;
         uint64_t total_h2d_bytes = 0;
+        uint64_t total_host_expert_bytes = 0;
         double total_fill_ms = 0.0;
 
         for (const auto & cache_group : groups) {
@@ -309,6 +324,7 @@ struct llama_moe_expert_cache::impl {
             total_cache_misses += state.stats.cache_misses;
             total_evictions += state.stats.evictions;
             total_h2d_bytes += state.stats.h2d_bytes;
+            total_host_expert_bytes += state.stats.host_expert_bytes;
             const uint64_t wall_clock_hz = cache_group->device_desc.wall_clock_hz;
             if (wall_clock_hz > 0) {
                 total_fill_ms += state.stats.fill_ticks * 1000.0 / wall_clock_hz;
@@ -319,7 +335,7 @@ struct llama_moe_expert_cache::impl {
             "MoE expert cache: resolves = %" PRIu64 ", updates = %" PRIu64
             ", read-only routes = %" PRIu64 ", resident routes = %" PRIu64
             ", streamed routes = %" PRIu64 ", hits = %" PRIu64 ", misses = %" PRIu64
-            ", evictions = %" PRIu64 ", H2D = %.2f MiB, fill = %.2f ms\n",
+            ", evictions = %" PRIu64 ", H2D = %.2f MiB, host expert bytes = %.2f MiB, fill = %.2f ms\n",
             total_resolve_calls,
             total_update_touches,
             total_read_only_touches,
@@ -329,6 +345,7 @@ struct llama_moe_expert_cache::impl {
             total_cache_misses,
             total_evictions,
             total_h2d_bytes / 1024.0 / 1024.0,
+            total_host_expert_bytes / 1024.0 / 1024.0,
             total_fill_ms);
     }
 
@@ -382,6 +399,7 @@ llama_moe_cache_binding llama_moe_expert_cache::bind(
         ggml_backend_sched_t sched,
         int il,
         ggml_tensor * ids,
+        ggml_tensor * policy,
         ggml_tensor * up,
         ggml_tensor * gate,
         ggml_tensor * down,
@@ -426,16 +444,6 @@ llama_moe_cache_binding llama_moe_expert_cache::bind(
         };
     }
 
-    if (ggml_nelements(ids) > pimpl->n_cache_experts) {
-        return {
-            /*.up      =*/ up,
-            /*.gate    =*/ gate,
-            /*.down    =*/ down,
-            /*.gate_up =*/ gate_up,
-            /*.ids     =*/ ids,
-        };
-    }
-
     if (pimpl->n_cache_experts == (uint64_t) cache_group->n_expert) {
         return {
             /*.up      =*/ impl::cached_weight(cache_group, up),
@@ -449,12 +457,15 @@ llama_moe_cache_binding llama_moe_expert_cache::bind(
     ggml_tensor * ids_cont = ggml_is_contiguous(ids) ? ids : ggml_cont(ctx, ids);
 
     if (cache_group->state != nullptr && cache_group->device_desc.magic == GGML_CUDA_EXPERT_CACHE_MAGIC) {
-        ggml_tensor * args[2 + GGML_CUDA_EXPERT_CACHE_MAX_WEIGHTS] = {
-            ids_cont,
-            cache_group->state,
-        };
+        const int state_index = policy != nullptr ? 2 : 1;
+        ggml_tensor * args[3 + GGML_CUDA_EXPERT_CACHE_MAX_WEIGHTS] = {};
+        args[0] = ids_cont;
+        if (policy != nullptr) {
+            args[1] = policy;
+        }
+        args[state_index] = cache_group->state;
         for (size_t i = 0; i < cache_group->weights.size(); ++i) {
-            args[2 + i] = cache_group->weights[i].slots;
+            args[state_index + 1 + i] = cache_group->weights[i].slots;
         }
 
         ggml_tensor * cache_ids = ggml_custom_4d(
@@ -465,7 +476,7 @@ llama_moe_cache_binding llama_moe_expert_cache::bind(
             ids_cont->ne[2],
             ids_cont->ne[3],
             args,
-            2 + cache_group->weights.size(),
+            state_index + 1 + cache_group->weights.size(),
             nullptr,
             1,
             &cache_group->device_desc);
@@ -473,6 +484,9 @@ llama_moe_cache_binding llama_moe_expert_cache::bind(
         if (ggml_backend_dev_supports_op(device, cache_ids)) {
             ggml_format_name(cache_ids, "blk.%d.moe_cache_ids", il);
             ggml_backend_sched_set_tensor_backend(sched, cache_ids, backend);
+            if (policy != nullptr) {
+                ggml_backend_sched_set_tensor_backend(sched, policy, backend);
+            }
             cache_group->device_resolver = true;
             return {
                 /*.up      =*/ impl::cached_weight(cache_group, up),

@@ -178,7 +178,7 @@ Source selector values use:
 
 ```text
 selector >= 0 : persistent cache slot
-selector = -1 : mapped host source
+selector < 0  : mapped host source, encoded as -logical_expert_id - 1
 ```
 
 ## Deterministic planning algorithm
@@ -250,8 +250,8 @@ HIP MMQ and MMV weight address selection uses:
 selector >= 0:
     cache_base + selector * cache_tensor.nb[2]
 
-selector = -1:
-    host_base + logical_expert_id * host_tensor.nb[2]
+selector < 0:
+    host_base + (-selector - 1) * host_tensor.nb[2]
 ```
 
 The source view supplies:

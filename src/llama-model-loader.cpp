@@ -1206,9 +1206,8 @@ struct ggml_tensor * llama_model_loader::create_tensor(
             }
         }
 
-        // avoid using a host buffer when using mmap
         auto * buft_dev = ggml_backend_buft_get_device(buft);
-        if (use_mmap && buft_dev && buft == ggml_backend_dev_host_buffer_type(buft_dev)) {
+        if (use_mmap && !moe_cache_weight && buft_dev && buft == ggml_backend_dev_host_buffer_type(buft_dev)) {
             auto * cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
             if (!cpu_dev) {
                 throw std::runtime_error("no CPU backend found");

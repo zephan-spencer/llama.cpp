@@ -121,6 +121,27 @@ protected:
 
 using llm_graph_input_ptr = std::unique_ptr<llm_graph_input_i>;
 
+inline bool llm_graph_has_moe_cache_policy(const llama_ubatch & ubatch) {
+    if (ubatch.moe_cache_policy == nullptr) {
+        return false;
+    }
+    for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+        if (ubatch.moe_cache_policy[i] != LLAMA_MOE_CACHE_POLICY_UPDATE) {
+            return true;
+        }
+    }
+    return false;
+}
+
+class llm_graph_input_moe_cache_policy : public llm_graph_input_i {
+public:
+    void set_input(const llama_ubatch * ubatch) override;
+
+    bool can_reuse(const llm_graph_params & params) override;
+
+    ggml_tensor * policy = nullptr; // I8 [n_tokens]
+};
+
 class llm_graph_input_embd : public llm_graph_input_i {
 public:
     llm_graph_input_embd(int64_t n_embd) : n_embd(n_embd) {}
@@ -782,6 +803,7 @@ struct llm_graph_params {
             arch  == other.arch  &&
             gtype == other.gtype &&
             moe_cache == other.moe_cache &&
+            llm_graph_has_moe_cache_policy(ubatch) == llm_graph_has_moe_cache_policy(other.ubatch) &&
             cvec  == other.cvec  &&
             loras == other.loras &&
             cross == other.cross;
@@ -836,6 +858,7 @@ public:
     // important graph nodes
     ggml_tensor * t_inp_tokens  = nullptr;
     ggml_tensor * t_inp_embd    = nullptr; // [n_embd_inp, n_tokens]
+    ggml_tensor * t_inp_moe_cache_policy = nullptr;
     ggml_tensor * t_logits      = nullptr;
     ggml_tensor * t_embd        = nullptr;
     ggml_tensor * t_embd_pooled = nullptr;
