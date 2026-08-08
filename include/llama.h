@@ -265,6 +265,7 @@ extern "C" {
         int32_t      *  n_seq_id;
         llama_seq_id ** seq_id;
         int8_t       *  logits;   // TODO: rename this to "output"
+        // if NULL, all tokens use LLAMA_MOE_CACHE_POLICY_UPDATE
         uint8_t      *  moe_cache_policy;
     } llama_batch;
 

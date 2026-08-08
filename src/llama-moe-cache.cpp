@@ -468,21 +468,34 @@ llama_moe_cache_binding llama_moe_expert_cache::bind(
             args[state_index + 1 + i] = cache_group->weights[i].slots;
         }
 
-        ggml_tensor * cache_ids = ggml_custom_4d(
+        const int64_t n_routes = ggml_nelements(ids_cont);
+        const int64_t route_storage_size = 2*n_routes + cache_group->n_expert + 1;
+        ggml_tensor * cache_plan = ggml_custom_4d(
             ctx,
             GGML_TYPE_I32,
-            ids_cont->ne[0],
-            ids_cont->ne[1],
-            ids_cont->ne[2],
-            ids_cont->ne[3],
+            route_storage_size,
+            1,
+            1,
+            1,
             args,
             state_index + 1 + cache_group->weights.size(),
             nullptr,
             1,
             &cache_group->device_desc);
 
-        if (ggml_backend_dev_supports_op(device, cache_ids)) {
+        if (ggml_backend_dev_supports_op(device, cache_plan)) {
+            // The first region is the selector tensor consumed by
+            // MUL_MAT_ID.  The cache-plan backend fills the following route
+            // order and boundary regions in the same allocation.
+            ggml_tensor * cache_ids = ggml_view_4d(
+                ctx,
+                cache_plan,
+                ids_cont->ne[0], ids_cont->ne[1], ids_cont->ne[2], ids_cont->ne[3],
+                ids_cont->nb[1], ids_cont->nb[2], ids_cont->nb[3],
+                0);
+            ggml_format_name(cache_plan, "blk.%d.moe_cache_plan", il);
             ggml_format_name(cache_ids, "blk.%d.moe_cache_ids", il);
+            ggml_backend_sched_set_tensor_backend(sched, cache_plan, backend);
             ggml_backend_sched_set_tensor_backend(sched, cache_ids, backend);
             if (policy != nullptr) {
                 ggml_backend_sched_set_tensor_backend(sched, policy, backend);

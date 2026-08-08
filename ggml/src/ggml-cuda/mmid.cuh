@@ -4,6 +4,8 @@
 
 struct ggml_cuda_expert_source_view {
     const int32_t * selectors;
+    const int32_t * route_ids;
+    const int32_t * route_bounds;
     int64_t selector_stride;
     uint32_t selector_width;
     const char * host_data;
@@ -15,6 +17,12 @@ struct ggml_cuda_expert_plan {
     int32_t * ids_src;
     int32_t * ids_dst;
     int32_t * expert_bounds;
+
+    // Optional route data produced by the cache planner.  Unlike ids_dst and
+    // expert_bounds above, these buffers are owned by the cache-plan output
+    // and are reused by every projection in the layer.
+    int32_t * route_ids;
+    int32_t * route_bounds;
 
     int32_t * expert_order;
     int32_t * fill_expert;
@@ -57,4 +65,17 @@ void ggml_cuda_launch_expert_cache_plan(
         int n_tokens,
         int n_expert_used,
         int n_cache,
+        cudaStream_t stream);
+
+// Build the projection-specific source index from a route order saved by the
+// cache planner.  This is deliberately a single linear pass; route grouping
+// itself must not be repeated for each projection.
+void ggml_cuda_launch_expert_plan_input_index(
+        const int32_t * route_ids,
+        int32_t * ids_src,
+        int n_routes,
+        int n_expert_used,
+        int nchannels_y,
+        int sis1,
+        bool write_inverse,
         cudaStream_t stream);

@@ -122,15 +122,7 @@ protected:
 using llm_graph_input_ptr = std::unique_ptr<llm_graph_input_i>;
 
 inline bool llm_graph_has_moe_cache_policy(const llama_ubatch & ubatch) {
-    if (ubatch.moe_cache_policy == nullptr) {
-        return false;
-    }
-    for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
-        if (ubatch.moe_cache_policy[i] != LLAMA_MOE_CACHE_POLICY_UPDATE) {
-            return true;
-        }
-    }
-    return false;
+    return ubatch.moe_cache_policy != nullptr;
 }
 
 class llm_graph_input_moe_cache_policy : public llm_graph_input_i {

@@ -133,12 +133,11 @@ static plan_result make_reference(const test_case & test) {
     }
     result.expert_bounds[test.n_expert] = compact;
 
-    const bool compatibility = test.policy.empty() || test.policy[0] == 2;
     std::vector<bool> requested(test.n_expert, false);
     std::vector<int32_t> unique;
     for (int32_t route = 0; route < n_ids; ++route) {
         const int32_t expert = test.ids[route];
-        const bool update = compatibility || test.policy.empty() || test.policy[route / test.n_expert_used] == 1;
+        const bool update = test.policy.empty() || test.policy[route / test.n_expert_used] == 1;
         result.n_read_only += !update;
         if (!update) {
             continue;
@@ -147,12 +146,6 @@ static plan_result make_reference(const test_case & test) {
             requested[expert] = true;
             unique.push_back(expert);
         }
-    }
-
-    if (compatibility && (int32_t) unique.size() > test.n_cache) {
-        std::fill(requested.begin(), requested.end(), false);
-        result.n_read_only = n_ids;
-        unique.clear();
     }
 
     result.n_active = unique.size();
@@ -263,6 +256,8 @@ static void run_case(const test_case & test, hipStream_t stream) {
     device_buffer<int32_t> ids_src(n_ids);
     device_buffer<int32_t> ids_dst(n_ids);
     device_buffer<int32_t> expert_bounds(test.n_expert + 1);
+    device_buffer<int32_t> saved_route_ids(n_ids);
+    device_buffer<int32_t> saved_route_bounds(test.n_expert + 1);
     device_buffer<int32_t> expert_order(test.n_cache);
     device_buffer<int32_t> fill_expert(test.n_cache);
     device_buffer<int32_t> fill_slot(test.n_cache);
@@ -291,6 +286,8 @@ static void run_case(const test_case & test, hipStream_t stream) {
     plan.ids_src = ids_src.ptr;
     plan.ids_dst = ids_dst.ptr;
     plan.expert_bounds = expert_bounds.ptr;
+    plan.route_ids = saved_route_ids.ptr;
+    plan.route_bounds = saved_route_bounds.ptr;
     plan.expert_order = expert_order.ptr;
     plan.fill_expert = fill_expert.ptr;
     plan.fill_slot = fill_slot.ptr;
@@ -327,6 +324,8 @@ static void run_case(const test_case & test, hipStream_t stream) {
     expect_equal(test.name, "ids_src", ids_src.get(), expected.ids_src, n_ids);
     expect_equal(test.name, "ids_dst", ids_dst.get(), expected.ids_dst, n_ids);
     expect_equal(test.name, "expert_bounds", expert_bounds.get(), expected.expert_bounds, test.n_expert + 1);
+    expect_equal(test.name, "saved_route_ids", saved_route_ids.get(), expected.ids_dst, n_ids);
+    expect_equal(test.name, "saved_route_bounds", saved_route_bounds.get(), expected.expert_bounds, test.n_expert + 1);
     expect_equal(test.name, "expert_order", expert_order.get(), expected.expert_order, expected.n_resident + expected.n_fill);
     expect_equal(test.name, "fill_expert", fill_expert.get(), expected.fill_expert, expected.n_fill);
     expect_equal(test.name, "fill_slot", fill_slot.get(), expected.fill_slot, expected.n_fill);
@@ -505,6 +504,186 @@ static void run_backend_source_case(ggml_backend_t backend, ggml_type type, int3
     hip_check(hipHostFree(host_data), "hipHostFree");
 }
 
+static size_t align_up(size_t value, size_t alignment) {
+    return (value + alignment - 1) & ~(alignment - 1);
+}
+
+static void run_backend_cached_source_case(ggml_backend_t backend, ggml_type type) {
+    const int64_t n_expert      = 8;
+    const int64_t n_cache       = 3;
+    const int64_t n_expert_used = 4;
+    const int64_t n_tokens      = 128;
+    const int64_t n_rows        = 8;
+    const int64_t n_cols        = 256;
+    const size_t row_size       = ggml_row_size(type, n_cols);
+    const size_t expert_size    = row_size * n_rows;
+    const size_t host_size      = expert_size * n_expert;
+
+    void * host_data = nullptr;
+    hip_check(hipHostMalloc(&host_data, host_size, hipHostMallocMapped), "hipHostMalloc");
+
+    try {
+        std::vector<float> rows(n_rows * n_cols);
+        for (int64_t expert = 0; expert < n_expert; ++expert) {
+            for (int64_t row = 0; row < n_rows; ++row) {
+                for (int64_t col = 0; col < n_cols; ++col) {
+                    rows[row*n_cols + col] = 0.25f * (expert + 1) + 0.003f * row + 0.0001f * col;
+                }
+            }
+            const size_t written = ggml_quantize_chunk(
+                type, rows.data(), static_cast<uint8_t *>(host_data) + expert*expert_size,
+                0, n_rows, n_cols, nullptr);
+            if (written != expert_size) {
+                throw std::runtime_error("cached source quantization size mismatch");
+            }
+        }
+
+        void * host_device_data = nullptr;
+        hip_check(hipHostGetDevicePointer(&host_device_data, host_data, 0), "hipHostGetDevicePointer");
+
+        ggml_backend_cuda_expert_cache_weight source_weight = {
+            host_data,
+            host_device_data,
+            0,
+            expert_size,
+        };
+        ggml_backend_cuda_expert_source source_desc = {
+            GGML_CUDA_EXPERT_SOURCE_MAGIC,
+            static_cast<uint32_t>(n_expert),
+            &source_weight,
+        };
+
+        ggml_backend_cuda_expert_cache_desc cache_desc = {};
+        cache_desc.magic = GGML_CUDA_EXPERT_CACHE_MAGIC;
+        cache_desc.version = GGML_CUDA_EXPERT_CACHE_VERSION;
+        cache_desc.n_expert = n_expert;
+        cache_desc.n_cache = n_cache;
+        cache_desc.n_weights = 1;
+        cache_desc.weights[0] = source_weight;
+
+        size_t state_offset = sizeof(ggml_backend_cuda_expert_cache_state);
+        cache_desc.expert_to_cache_offset = align_up(state_offset, alignof(int32_t));
+        state_offset = cache_desc.expert_to_cache_offset + n_expert*sizeof(int32_t);
+        cache_desc.cache_to_expert_offset = align_up(state_offset, alignof(int32_t));
+        state_offset = cache_desc.cache_to_expert_offset + n_cache*sizeof(int32_t);
+        cache_desc.last_used_offset = align_up(state_offset, alignof(uint64_t));
+        state_offset = cache_desc.last_used_offset + n_cache*sizeof(uint64_t);
+        cache_desc.fill_expert_offset = align_up(state_offset, alignof(int32_t));
+        state_offset = cache_desc.fill_expert_offset + n_cache*sizeof(int32_t);
+        cache_desc.fill_slot_offset = align_up(state_offset, alignof(int32_t));
+        state_offset = cache_desc.fill_slot_offset + n_cache*sizeof(int32_t);
+        cache_desc.state_size = align_up(state_offset, 256);
+
+        ggml_init_params params = {
+            ggml_tensor_overhead()*64 + 2*ggml_graph_overhead_custom(64, false),
+            nullptr,
+            true,
+        };
+        ggml_context_ptr ctx(ggml_init(params));
+        if (!ctx) {
+            throw std::runtime_error("failed to create cached source test context");
+        }
+
+        ggml_tensor * slots = ggml_new_tensor_3d(ctx.get(), type, n_cols, n_rows, n_cache);
+        ggml_tensor * full  = ggml_new_tensor_3d(ctx.get(), type, n_cols, n_rows, n_expert);
+        ggml_tensor * input = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F32, n_cols, n_expert_used, n_tokens);
+        ggml_tensor * ids   = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_I32, n_expert_used, n_tokens);
+        ggml_tensor * state = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_I8, cache_desc.state_size);
+
+        slots->extra = &source_desc;
+
+        const int64_t n_routes = n_tokens*n_expert_used;
+        const int64_t route_storage_size = 2*n_routes + n_expert + 1;
+        ggml_tensor * cache_args[] = { ids, state, slots };
+        ggml_tensor * cache_plan = ggml_custom_4d(
+            ctx.get(), GGML_TYPE_I32, route_storage_size, 1, 1, 1,
+            cache_args, 3, nullptr, 1, &cache_desc);
+        ggml_tensor * cache_ids = ggml_view_4d(
+            ctx.get(), cache_plan,
+            ids->ne[0], ids->ne[1], ids->ne[2], ids->ne[3],
+            ids->nb[1], ids->nb[2], ids->nb[3], 0);
+
+        ggml_tensor * source_out = ggml_mul_mat_id(ctx.get(), slots, input, ids);
+        source_out->src[3] = cache_ids;
+        ggml_tensor * full_out = ggml_mul_mat_id(ctx.get(), full, input, ids);
+
+        ggml_backend_buffer_ptr buffer(ggml_backend_alloc_ctx_tensors(ctx.get(), backend));
+        if (!buffer) {
+            throw std::runtime_error("failed to allocate cached source test tensors");
+        }
+
+        std::vector<float> input_data(n_cols * n_expert_used * n_tokens);
+        std::vector<int32_t> ids_data(n_routes);
+        const std::array<int32_t, 16> route_pattern = {
+            5, 5, 1, 7, 2, 3, 2, 6, 0, 7, 5, 4, 6, 2, 1, 5,
+        };
+        for (int64_t token = 0; token < n_tokens; ++token) {
+            for (int64_t used = 0; used < n_expert_used; ++used) {
+                const int64_t route = token*n_expert_used + used;
+                ids_data[route] = route_pattern[route % route_pattern.size()];
+                for (int64_t col = 0; col < n_cols; ++col) {
+                    input_data[route*n_cols + col] = 0.01f * (1 + col % 17) + 0.002f * used;
+                }
+            }
+        }
+
+        std::vector<uint8_t> state_data(cache_desc.state_size, 0);
+        std::fill(
+            reinterpret_cast<int32_t *>(state_data.data() + cache_desc.expert_to_cache_offset),
+            reinterpret_cast<int32_t *>(state_data.data() + cache_desc.expert_to_cache_offset) + n_expert, -1);
+        std::fill(
+            reinterpret_cast<int32_t *>(state_data.data() + cache_desc.cache_to_expert_offset),
+            reinterpret_cast<int32_t *>(state_data.data() + cache_desc.cache_to_expert_offset) + n_cache, -1);
+
+        ggml_backend_tensor_set(full, host_data, 0, host_size);
+        ggml_backend_tensor_set(input, input_data.data(), 0, input_data.size() * sizeof(float));
+        ggml_backend_tensor_set(ids, ids_data.data(), 0, ids_data.size() * sizeof(int32_t));
+        ggml_backend_tensor_set(state, state_data.data(), 0, state_data.size());
+
+        ggml_cgraph * source_graph = ggml_new_graph_custom(ctx.get(), 64, false);
+        ggml_build_forward_expand(source_graph, source_out);
+        ggml_cgraph * full_graph = ggml_new_graph_custom(ctx.get(), 64, false);
+        ggml_build_forward_expand(full_graph, full_out);
+
+        auto compare = [&](const char * label) {
+            if (ggml_backend_graph_compute(backend, source_graph) != GGML_STATUS_SUCCESS ||
+                    ggml_backend_graph_compute(backend, full_graph) != GGML_STATUS_SUCCESS) {
+                throw std::runtime_error(std::string(label) + ": cached source graph execution failed");
+            }
+
+            std::vector<float> source_result(ggml_nelements(source_out));
+            std::vector<float> full_result(ggml_nelements(full_out));
+            ggml_backend_tensor_get(source_out, source_result.data(), 0, source_result.size() * sizeof(float));
+            ggml_backend_tensor_get(full_out, full_result.data(), 0, full_result.size() * sizeof(float));
+
+            float max_error = 0.0f;
+            float max_value = 0.0f;
+            for (size_t i = 0; i < source_result.size(); ++i) {
+                max_error = std::max(max_error, std::fabs(source_result[i] - full_result[i]));
+                max_value = std::max(max_value, std::fabs(full_result[i]));
+            }
+            if (max_error > 2e-3f * std::max(1.0f, max_value)) {
+                throw std::runtime_error(
+                    std::string(label) + ": cached source mismatch for " + ggml_type_name(type) +
+                    " max_error=" + std::to_string(max_error));
+            }
+        };
+
+        compare("cached-first");
+
+        std::reverse(ids_data.begin(), ids_data.end());
+        ggml_backend_tensor_set(ids, ids_data.data(), 0, ids_data.size() * sizeof(int32_t));
+        compare("cached-reuse");
+
+        std::printf("cached-source-%s: OK\n", ggml_type_name(type));
+    } catch (...) {
+        hip_check(hipHostFree(host_data), "hipHostFree");
+        throw;
+    }
+
+    hip_check(hipHostFree(host_data), "hipHostFree");
+}
+
 static std::vector<int32_t> identity_experts(int32_t n_expert) {
     std::vector<int32_t> result(n_expert);
     for (int32_t i = 0; i < n_expert; ++i) {
@@ -564,14 +743,14 @@ int main() {
         }, stream);
 
         std::vector<int32_t> duplicate_ids;
-        for (int32_t token = 0; token < 64; ++token) {
+        for (int32_t token = 0; token < 128; ++token) {
             duplicate_ids.insert(duplicate_ids.end(), { 3, 7, 11, 15 });
         }
         run_case({
             "duplicate-heavy",
             32,
             8,
-            64,
+            128,
             4,
             std::move(duplicate_ids),
             std::vector<int32_t>(8, -1),
@@ -633,19 +812,6 @@ int main() {
         }, stream);
 
         run_case({
-            "compatibility-overflow",
-            8,
-            2,
-            2,
-            2,
-            { 0, 1, 2, 3 },
-            { -1, -1 },
-            { 0, 0 },
-            0,
-            { 2, 2 },
-        }, stream);
-
-        run_case({
             "null-policy-overflow",
             8,
             2,
@@ -662,6 +828,7 @@ int main() {
             run_backend_source_case(backend, type, 4);
             run_backend_source_case(backend, type, 8);
             run_backend_source_case(backend, type, 16);
+            run_backend_cached_source_case(backend, type);
         }
     } catch (const std::exception & error) {
         std::fprintf(stderr, "%s\n", error.what());

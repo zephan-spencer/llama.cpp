@@ -127,6 +127,15 @@ bool ggml_cuda_expert_cache_supported(const ggml_tensor * dst) {
     if (dst->type != GGML_TYPE_I32 || dst->src[0] == nullptr || dst->src[0]->type != GGML_TYPE_I32 || !ggml_is_contiguous(dst->src[0])) {
         return false;
     }
+    // The cache-plan result contains, in order, the per-route source
+    // selectors, the route order grouped by expert, and expert boundaries.
+    // Keep all three in one graph-managed allocation so the latter two remain
+    // live until every projection in the layer has consumed them.
+    const size_t n_routes = ggml_nelements(dst->src[0]);
+    const size_t route_plan_bytes = (2*n_routes + desc->n_expert + 1) * sizeof(int32_t);
+    if (ggml_nbytes(dst) < route_plan_bytes) {
+        return false;
+    }
     if (dst->src[1] == nullptr || dst->src[1]->type != GGML_TYPE_I8 || !ggml_is_contiguous(dst->src[1])) {
         return false;
     }
@@ -226,6 +235,9 @@ void ggml_cuda_expert_cache(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
     plan.fill_expert = reinterpret_cast<int32_t *>(state_data + params.fill_expert_offset);
     plan.fill_slot = reinterpret_cast<int32_t *>(state_data + params.fill_slot_offset);
     plan.cache_ids = static_cast<int32_t *>(dst->data);
+    const size_t n_routes = params.n_routes;
+    plan.route_ids = reinterpret_cast<int32_t *>(static_cast<uint8_t *>(dst->data) + n_routes*sizeof(int32_t));
+    plan.route_bounds = plan.route_ids + n_routes;
     plan.expert_to_cache = reinterpret_cast<int32_t *>(state_data + params.expert_to_cache_offset);
     plan.cache_to_expert = reinterpret_cast<int32_t *>(state_data + params.cache_to_expert_offset);
     plan.last_used = reinterpret_cast<uint64_t *>(state_data + params.last_used_offset);

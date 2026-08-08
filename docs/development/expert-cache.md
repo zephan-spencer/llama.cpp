@@ -37,6 +37,7 @@ Version 1 excludes tensor-parallel coordination, expert parallelism, DeepSeek-sp
 | policy state | `expert_to_slot`, `slot_to_expert`, `last_used`, and `use_clock`. |
 | source selector | Execution metadata selecting a cache slot or the host-source sentinel. |
 | plan | One layer's policy update and route classification for one physical ubatch. |
+| saved route plan | The grouped route order and expert boundaries published by the cache plan for reuse by all projections in that layer. |
 
 ## User interface
 
@@ -94,23 +95,9 @@ LLAMA_MOE_CACHE_POLICY_READ_ONLY
 LLAMA_MOE_CACHE_POLICY_UPDATE
 ```
 
-A null policy pointer selects compatibility mode for the complete logical batch. Batch allocation, slicing, sequence reordering, embedding input, token input, graph reuse, and logical-to-physical ubatch conversion MUST preserve policy-to-token association.
+A null policy pointer means `UPDATE` for every token. A non-null policy pointer supplies one policy value per token. Batch allocation, slicing, sequence reordering, embedding input, token input, graph reuse, and logical-to-physical ubatch conversion MUST preserve policy-to-token association.
 
-Server assignment uses:
-
-| Token source | Policy |
-| --- | --- |
-| prompt ingestion | `READ_ONLY` |
-| generated decode token | `UPDATE` |
-| speculative decode token | `UPDATE` |
-| accepted draft token | `UPDATE` |
-
-Compatibility mode resolves independently for each layer plan:
-
-| Unique routed working set | Effective policy |
-| --- | --- |
-| size `<= N` | `UPDATE` for every route |
-| size `> N` | `READ_ONLY` for every route |
+Callers that provide a policy array use `READ_ONLY` for routes that must preserve policy state and `UPDATE` for routes eligible to admit or evict experts.
 
 ## Layer ownership and lifetime
 
@@ -160,19 +147,25 @@ Unique expert order uses the first flattened occurrence of each logical expert. 
 One layer plan consumes:
 
 - logical route IDs with shape `[n_expert_used, n_tokens]`;
-- token policy with shape `[n_tokens]`, or the resolved compatibility policy;
+- token policy with shape `[n_tokens]`, or implicit `UPDATE` when the policy pointer is null;
 - current policy state;
 - `n_expert` and `N`.
 
 One layer plan emits:
 
-- compact expert-major route indices;
-- expert bounds for compact execution;
+- one compact expert-major route order;
+- one start/end boundary pair for every expert;
 - source selectors with the same logical shape as route IDs;
 - fill expert IDs;
 - fill slot IDs;
 - updated policy state;
 - counter deltas.
+
+The compact route order, expert boundaries, and source selectors MUST be
+stored in graph-managed GPU memory. Gate, up, merged gate-up, and down
+projections in the layer MUST reuse this saved route plan. A projection MAY
+derive its own activation/input index from the saved route order, but it MUST
+do so with one linear pass and MUST NOT regroup the logical routes.
 
 Source selector values use:
 
@@ -282,12 +275,17 @@ The backend scheduler MUST establish this dependency order:
 ```text
 router output
     -> policy plan
-    -> cache fills
+    -> route grouping and cache fills
     -> source-aware gate/up or gate-up mul_mat_id
     -> graph activation operations
     -> source-aware down mul_mat_id
     -> graph route weighting and reduction
 ```
+
+For one physical ubatch and cached layer, route grouping occurs exactly once,
+inside the cache-planning operation, before cache fills and matrix operations.
+Operations outside the expert-cache path retain their existing route
+calculation.
 
 Cache-slot reuse MUST wait for completion of every earlier operation reading that slot. Host mappings MUST exist before graph construction and persist through graph completion.
 

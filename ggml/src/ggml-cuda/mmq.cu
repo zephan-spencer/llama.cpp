@@ -182,18 +182,33 @@ void ggml_cuda_mul_mat_q(
     GGML_ASSERT(ne1 == n_expert_used);
 
     ggml_cuda_pool_alloc<int32_t> ids_src1(ctx.pool(), ne_get_rows);
-    ggml_cuda_pool_alloc<int32_t> ids_dst(ctx.pool(), ne_get_rows);
+    ggml_cuda_pool_alloc<int32_t> ids_dst(ctx.pool());
     const int64_t n_experts = source != nullptr ? source->n_expert : ne02;
-    ggml_cuda_pool_alloc<int32_t> expert_bounds(ctx.pool(), n_experts + 1);
+    ggml_cuda_pool_alloc<int32_t> expert_bounds(ctx.pool());
 
     // gate/up activations are broadcast across experts (ne11 == 1): quantize each token once and
     // scatter to its slots. ids_src1 then holds the inverse map (token slot -> compact row).
     const bool dedup_bcast = ne11 == 1 && n_expert_used > 1;
+    GGML_ASSERT(ids->nb[0] == ggml_element_size(ids));
+    const int sis1 = nb12 / nb11;
+    GGML_ASSERT(sis1 > 0);
 
-    {
-        GGML_ASSERT(ids->nb[0] == ggml_element_size(ids));
-        const int si1  = ids->nb[1] / ggml_element_size(ids);
-        const int sis1 = nb12 / nb11;
+    const bool saved_routes = source != nullptr && source->route_ids != nullptr && source->route_bounds != nullptr;
+
+    if (saved_routes) {
+        // The cache planner has already produced the route order and expert
+        // boundaries for this physical batch.  Only derive the input index
+        // needed by this projection; do not regroup the routes.
+        ggml_cuda_launch_expert_plan_input_index(
+            source->route_ids, ids_src1.get(), static_cast<int>(ne_get_rows),
+            static_cast<int>(n_expert_used), static_cast<int>(ne11),
+            static_cast<int>(sis1), dedup_bcast, stream);
+        CUDA_CHECK(cudaGetLastError());
+    } else {
+        ids_dst.alloc(ctx.pool(), ne_get_rows);
+        expert_bounds.alloc(ctx.pool(), n_experts + 1);
+
+        const int si1 = ids->nb[1] / ggml_element_size(ids);
 
         ggml_cuda_expert_plan plan = {};
         plan.ids_src = ids_src1.get();
@@ -248,7 +263,9 @@ void ggml_cuda_mul_mat_q(
 
     // Note that ne02 is used instead of ne12 because the number of y channels determines the z dimension of the CUDA grid.
     const mmq_args args = {
-        src0_d, src0->type, (const int *) src1_q8_1.get(), ids_dst.get(), expert_bounds.get(),
+        src0_d, src0->type, (const int *) src1_q8_1.get(),
+        saved_routes ? source->route_ids : ids_dst.get(),
+        saved_routes ? source->route_bounds : expert_bounds.get(),
         source != nullptr ? source->selectors : nullptr,
         source != nullptr ? source->host_data : nullptr,
         source != nullptr ? source->host_stride : 0,

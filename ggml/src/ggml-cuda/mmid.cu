@@ -60,6 +60,57 @@ static void launch_expert_plan_routes(
         (ids, ids_src1, ids_dst, expert_bounds, n_tokens, n_expert_used_var, nchannels_y, si1, sis1, write_inverse);
 }
 
+static __global__ void expert_plan_input_index(
+        const int32_t * __restrict__ route_ids,
+        int32_t * __restrict__ ids_src,
+        const int n_routes,
+        const int n_expert_used,
+        const int nchannels_y,
+        const int sis1,
+        const bool write_inverse) {
+    for (int route_index = blockIdx.x * blockDim.x + threadIdx.x;
+            route_index < n_routes;
+            route_index += blockDim.x * gridDim.x) {
+        const int route = route_ids[route_index];
+        if (write_inverse) {
+            // Quantize-scatter consumes the inverse map (original route ->
+            // compact row), whereas the regular quantizer consumes the
+            // compact-row -> source-row map.
+            ids_src[route] = route_index;
+        } else {
+            const int token = route / n_expert_used;
+            const int expert_slot = route % n_expert_used;
+            ids_src[route_index] = token * sis1 + expert_slot % nchannels_y;
+        }
+    }
+}
+
+void ggml_cuda_launch_expert_plan_input_index(
+        const int32_t * route_ids,
+        int32_t * ids_src,
+        const int n_routes,
+        const int n_expert_used,
+        const int nchannels_y,
+        const int sis1,
+        const bool write_inverse,
+        cudaStream_t stream) {
+    GGML_ASSERT(route_ids != nullptr);
+    GGML_ASSERT(ids_src != nullptr);
+    GGML_ASSERT(n_routes >= 0);
+    GGML_ASSERT(n_expert_used > 0);
+    GGML_ASSERT(nchannels_y > 0);
+    GGML_ASSERT(sis1 > 0);
+
+    if (n_routes == 0) {
+        return;
+    }
+
+    constexpr int block_size = 256;
+    const int n_blocks = (n_routes + block_size - 1) / block_size;
+    expert_plan_input_index<<<n_blocks, block_size, 0, stream>>>(
+        route_ids, ids_src, n_routes, n_expert_used, nchannels_y, sis1, write_inverse);
+}
+
 static __global__ void expert_plan_cache(
         const int32_t * ids,
         ggml_cuda_expert_plan plan,
@@ -81,13 +132,12 @@ static __global__ void expert_plan_cache(
         return;
     }
 
-    const bool compatibility = plan.policy == nullptr || plan.policy[0] == 2;
     int32_t n_active = 0;
     int32_t n_read_only = 0;
     for (int64_t i = 0; i < n_ids; ++i) {
         const int32_t expert = ids[i];
         assert(expert >= 0 && expert < n_experts);
-        const bool update = compatibility || plan.policy == nullptr || plan.policy[i / n_expert_used] == 1;
+        const bool update = plan.policy == nullptr || plan.policy[i / n_expert_used] == 1;
         n_read_only += !update;
         if (!update) {
             continue;
@@ -97,14 +147,6 @@ static __global__ void expert_plan_cache(
             unique[n_active++] = expert;
         }
     }
-    if (compatibility && n_active > n_cache) {
-        for (int32_t expert = 0; expert < n_experts; ++expert) {
-            requested[expert] = 0;
-        }
-        n_read_only = n_ids;
-        n_active = 0;
-    }
-
     int32_t n_resident = 0;
     for (int32_t i = 0; i < n_active; ++i) {
         const int32_t expert = unique[i];
@@ -256,6 +298,20 @@ void ggml_cuda_launch_expert_cache_plan(
     GGML_ASSERT(plan.n_read_only != nullptr);
     GGML_ASSERT(plan.n_streamed != nullptr);
     GGML_ASSERT(plan.n_host_experts != nullptr);
+
+    if (plan.route_ids != nullptr || plan.route_bounds != nullptr) {
+        GGML_ASSERT(plan.route_ids != nullptr);
+        GGML_ASSERT(plan.route_bounds != nullptr);
+
+        // The cache plan owns the route grouping in the cached path.  Keep it
+        // on the same stream and before the cache-selection kernel so the
+        // grouped routes and boundaries are ready for all projections.
+        launch_expert_plan_routes(
+            ids, nullptr, plan.route_ids, plan.route_bounds,
+            n_experts, n_tokens, n_expert_used,
+            /*nchannels_y=*/1, /*si1=*/n_expert_used, /*sis1=*/n_expert_used,
+            /*write_inverse=*/false, stream);
+    }
 
     const size_t shared_size = 2 * n_experts * sizeof(int32_t);
     expert_plan_cache<<<1, 256, shared_size, stream>>>(

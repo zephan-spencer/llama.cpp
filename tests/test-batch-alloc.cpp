@@ -3,6 +3,7 @@
 #include "llama.h"
 
 #include "../src/llama-batch.h"
+#include "../src/llama-graph.h"
 #include "../src/llama-memory.h"
 #include "../src/llama-vocab.h"
 
@@ -676,6 +677,15 @@ int main(int argc, char ** argv) {
     t.test("split",     test_split);
     t.test("keep_tail", test_keep_tail);
     t.test("mrope",     test_mrope);
+    t.test("moe_policy_presence", [](testing & t) {
+        uint8_t update = LLAMA_MOE_CACHE_POLICY_UPDATE;
+        llama_ubatch ubatch = {};
+        ubatch.n_tokens = 1;
+
+        t.assert_true(!llm_graph_has_moe_cache_policy(ubatch));
+        ubatch.moe_cache_policy = &update;
+        t.assert_true(llm_graph_has_moe_cache_policy(ubatch));
+    });
 
     return t.summary();
 }
