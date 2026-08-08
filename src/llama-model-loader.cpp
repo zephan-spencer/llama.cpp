@@ -1,4 +1,5 @@
 #include "llama-model-loader.h"
+#include "llama-moe-cache.h"
 
 #include "ggml-alloc.h"
 #include "ggml.h"
@@ -1149,14 +1150,8 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         }
 
         ggml_backend_buffer_type_t buft = nullptr;
-        const bool moe_cache_weight =
-            n_moe_cache_experts > 0 &&
-            tn.suffix != nullptr &&
-            strcmp(tn.suffix, "weight") == 0 &&
-            (tn.tensor == LLM_TENSOR_FFN_DOWN_EXPS ||
-             tn.tensor == LLM_TENSOR_FFN_GATE_EXPS ||
-             tn.tensor == LLM_TENSOR_FFN_UP_EXPS ||
-             tn.tensor == LLM_TENSOR_FFN_GATE_UP_EXPS);
+        const bool moe_cache_weight = n_moe_cache_experts > 0 &&
+            llama_moe_cache_is_routed_weight(tn.tensor, tn.suffix);
 
         // check overrides
         if (tensor_buft_overrides) {

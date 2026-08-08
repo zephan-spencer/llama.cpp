@@ -1,5 +1,7 @@
 #pragma once
 
+#include "llama-arch.h"
+
 #include "ggml-backend.h"
 
 #include <map>
@@ -9,6 +11,9 @@
 struct ggml_context;
 struct ggml_tensor;
 struct llama_model;
+
+bool llama_moe_cache_is_routed_weight(llm_tensor tensor, const char * suffix);
+void llama_moe_cache_validate_model(const llama_model & model, uint32_t n_cache_experts);
 
 struct llama_moe_cache_binding {
     ggml_tensor * up;
@@ -31,7 +36,6 @@ public:
             ggml_backend_sched_t sched,
             int il,
             ggml_tensor * ids,
-            ggml_tensor * policy,
             ggml_tensor * up,
             ggml_tensor * gate,
             ggml_tensor * down,

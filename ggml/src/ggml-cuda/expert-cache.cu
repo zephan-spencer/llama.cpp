@@ -1,13 +1,173 @@
 #include "expert-cache.cuh"
+#include "expert-cache-private.cuh"
 #include "mmid.cuh"
 
 #include "ggml-cuda.h"
 #include "ggml-impl.h"
 
+#include <algorithm>
 #include <cstdint>
 #include <cstring>
+#include <vector>
 
 #if defined(GGML_USE_HIP)
+
+static bool ggml_backend_cuda_moe_cache_supports(ggml_backend_dev_t device) {
+    return device != nullptr && ggml_backend_dev_type(device) == GGML_BACKEND_DEVICE_TYPE_GPU;
+}
+
+static size_t ggml_backend_cuda_moe_cache_state_size(uint32_t n_expert, uint32_t n_cache, uint32_t n_weights) {
+    if (n_expert == 0 || n_cache == 0 || n_cache >= n_expert ||
+            n_weights == 0 || n_weights > GGML_BACKEND_MOE_CACHE_MAX_WEIGHTS) {
+        return 0;
+    }
+    return ggml_cuda_expert_cache_layout(n_expert, n_cache).state_size;
+}
+
+static ggml_backend_moe_cache_t ggml_backend_cuda_moe_cache_create(
+        ggml_backend_t backend,
+        ggml_tensor * state,
+        ggml_tensor * const * source,
+        ggml_tensor * const * slots,
+        uint32_t n_expert,
+        uint32_t n_cache,
+        uint32_t n_weights) {
+    const size_t state_size = ggml_backend_cuda_moe_cache_state_size(n_expert, n_cache, n_weights);
+    if (backend == nullptr || state_size == 0 || state == nullptr || source == nullptr || slots == nullptr ||
+            state->buffer == nullptr || ggml_nbytes(state) < state_size) {
+        return nullptr;
+    }
+
+    const ggml_backend_dev_t device = ggml_backend_get_device(backend);
+    if (device == nullptr || ggml_backend_buft_get_device(ggml_backend_buffer_get_type(state->buffer)) != device) {
+        return nullptr;
+    }
+
+    auto * cache = new ggml_backend_moe_cache{};
+    cache->backend = backend;
+    cache->state = state;
+    auto & desc = cache->desc;
+    desc.magic = GGML_CUDA_EXPERT_CACHE_MAGIC;
+    desc.version = GGML_CUDA_EXPERT_CACHE_VERSION;
+    desc.n_expert = n_expert;
+    desc.n_cache = n_cache;
+    desc.n_weights = n_weights;
+    desc.state_size = state_size;
+    const auto layout = ggml_cuda_expert_cache_layout(n_expert, n_cache);
+    desc.expert_to_cache_offset = layout.expert_to_cache_offset;
+    desc.cache_to_expert_offset = layout.cache_to_expert_offset;
+    desc.last_used_offset = layout.last_used_offset;
+    desc.fill_expert_offset = layout.fill_expert_offset;
+    desc.fill_slot_offset = layout.fill_slot_offset;
+    for (uint32_t i = 0; i < n_weights; ++i) {
+        if (source[i] == nullptr || slots[i] == nullptr || source[i]->buffer == nullptr ||
+                source[i]->data == nullptr || slots[i]->buffer == nullptr ||
+                !ggml_backend_buffer_is_host(source[i]->buffer) ||
+                ggml_backend_buffer_get_type(source[i]->buffer) != ggml_backend_dev_host_buffer_type(device) ||
+                ggml_backend_buft_get_device(ggml_backend_buffer_get_type(slots[i]->buffer)) != device ||
+                source[i]->type != slots[i]->type || source[i]->ne[0] != slots[i]->ne[0] ||
+                source[i]->ne[1] != slots[i]->ne[1] || source[i]->ne[2] != n_expert ||
+                source[i]->ne[3] != 1 || slots[i]->ne[2] != n_cache || slots[i]->ne[3] != 1 ||
+                source[i]->nb[2] != slots[i]->nb[2]) {
+            delete cache;
+            return nullptr;
+        }
+    }
+    for (uint32_t i = 0; i < n_weights; ++i) {
+        const uint8_t * base = static_cast<const uint8_t *>(ggml_backend_buffer_get_base(source[i]->buffer));
+        desc.weights[i] = {
+            base,
+            nullptr,
+            static_cast<uint64_t>(static_cast<const uint8_t *>(source[i]->data) - base),
+            static_cast<uint64_t>(source[i]->nb[2]),
+        };
+        cache->slots[i] = slots[i];
+        cache->source_bindings[i] = {
+            GGML_CUDA_EXPERT_SOURCE_MAGIC,
+            n_expert,
+            cache,
+            &desc.weights[i],
+        };
+        slots[i]->extra = &cache->source_bindings[i];
+    }
+    cache->plan_binding = {
+        GGML_CUDA_EXPERT_PLAN_MAGIC,
+        cache,
+    };
+    std::vector<uint8_t> data(state_size, 0);
+    auto * expert_to_cache = reinterpret_cast<int32_t *>(data.data() + desc.expert_to_cache_offset);
+    auto * cache_to_expert = reinterpret_cast<int32_t *>(data.data() + desc.cache_to_expert_offset);
+    std::fill(expert_to_cache, expert_to_cache + n_expert, -1);
+    std::fill(cache_to_expert, cache_to_expert + n_cache, -1);
+    ggml_backend_tensor_set(state, data.data(), 0, data.size());
+    return cache;
+}
+
+static void ggml_backend_cuda_moe_cache_destroy(ggml_backend_moe_cache_t cache) {
+    if (cache == nullptr) {
+        return;
+    }
+    for (uint32_t i = 0; i < cache->desc.n_weights; ++i) {
+        if (cache->slots[i] != nullptr && cache->slots[i]->extra == &cache->source_bindings[i]) {
+            cache->slots[i]->extra = nullptr;
+        }
+    }
+    delete cache;
+}
+
+static ggml_backend_moe_cache_plan ggml_backend_cuda_moe_cache_build_plan(
+        ggml_backend_moe_cache_t cache,
+        ggml_context * ctx,
+        ggml_tensor * ids) {
+    if (cache == nullptr || ctx == nullptr || ids == nullptr || ids->type != GGML_TYPE_I32) {
+        return { nullptr, nullptr };
+    }
+    const int64_t n_routes = ggml_nelements(ids);
+    const auto layout = ggml_cuda_expert_cache_route_layout(n_routes, cache->desc.n_expert);
+    ggml_tensor * args[2 + GGML_BACKEND_MOE_CACHE_MAX_WEIGHTS] = {};
+    args[0] = ids;
+    args[1] = cache->state;
+    for (uint32_t i = 0; i < cache->desc.n_weights; ++i) {
+        args[2 + i] = cache->slots[i];
+    }
+    auto * execution = ggml_custom_4d(
+        ctx, GGML_TYPE_I32, layout.size/sizeof(int32_t), 1, 1, 1,
+        args, 2 + cache->desc.n_weights, nullptr, 1, &cache->desc);
+    auto * selectors = ggml_view_4d(
+        ctx, execution, ids->ne[0], ids->ne[1], ids->ne[2], ids->ne[3],
+        ids->nb[1], ids->nb[2], ids->nb[3], layout.selectors_offset);
+    selectors->extra = &cache->plan_binding;
+    return { selectors, execution };
+}
+
+static void ggml_backend_cuda_moe_cache_get_stats(
+        ggml_backend_moe_cache_t cache,
+        ggml_backend_moe_cache_stats * stats) {
+    ggml_backend_cuda_expert_cache_state state = {};
+    ggml_backend_tensor_get(cache->state, &state, 0, sizeof(state));
+    *stats = state.stats;
+    stats->wall_clock_hz = cache->desc.wall_clock_hz;
+}
+
+static void ggml_backend_cuda_moe_cache_reset_stats(ggml_backend_moe_cache_t cache) {
+    const ggml_backend_moe_cache_stats zero = {};
+    ggml_backend_tensor_set_async(cache->backend, cache->state, &zero,
+        offsetof(ggml_backend_cuda_expert_cache_state, stats), sizeof(zero));
+}
+static const ggml_backend_moe_cache_i ggml_backend_cuda_moe_cache_interface = {
+    GGML_BACKEND_MOE_CACHE_INTERFACE_VERSION,
+    ggml_backend_cuda_moe_cache_supports,
+    ggml_backend_cuda_moe_cache_state_size,
+    ggml_backend_cuda_moe_cache_create,
+    ggml_backend_cuda_moe_cache_destroy,
+    ggml_backend_cuda_moe_cache_build_plan,
+    ggml_backend_cuda_moe_cache_get_stats,
+    ggml_backend_cuda_moe_cache_reset_stats,
+};
+
+extern "C" const ggml_backend_moe_cache_i * ggml_backend_cuda_moe_cache_get_interface() {
+    return &ggml_backend_cuda_moe_cache_interface;
+}
 
 struct expert_cache_weight {
     const uint8_t * host;
@@ -16,7 +176,7 @@ struct expert_cache_weight {
 };
 
 struct expert_cache_params {
-    expert_cache_weight weights[GGML_CUDA_EXPERT_CACHE_MAX_WEIGHTS];
+    expert_cache_weight weights[GGML_BACKEND_MOE_CACHE_MAX_WEIGHTS];
     uint32_t n_expert;
     uint32_t n_cache;
     uint32_t n_weights;
@@ -61,7 +221,6 @@ static __global__ void expert_cache_record_plan_kernel(
 
     header->stats.resolve_calls++;
     header->stats.update_touches += header->n_active;
-    header->stats.read_only_touches += header->n_read_only;
     header->stats.resident_routes += params.n_routes;
     header->stats.resident_routes -= header->n_streamed;
     header->stats.streamed_routes += header->n_streamed;
@@ -121,19 +280,15 @@ static __global__ void expert_cache_copy_kernel(
 bool ggml_cuda_expert_cache_supported(const ggml_tensor * dst) {
     ggml_backend_cuda_expert_cache_desc * desc = expert_cache_desc(dst);
     if (desc == nullptr || desc->n_weights == 0 ||
-            desc->n_weights > GGML_CUDA_EXPERT_CACHE_MAX_WEIGHTS) {
+            desc->n_weights > GGML_BACKEND_MOE_CACHE_MAX_WEIGHTS) {
         return false;
     }
     if (dst->type != GGML_TYPE_I32 || dst->src[0] == nullptr || dst->src[0]->type != GGML_TYPE_I32 || !ggml_is_contiguous(dst->src[0])) {
         return false;
     }
-    // The cache-plan result contains, in order, the per-route source
-    // selectors, the route order grouped by expert, and expert boundaries.
-    // Keep all three in one graph-managed allocation so the latter two remain
-    // live until every projection in the layer has consumed them.
     const size_t n_routes = ggml_nelements(dst->src[0]);
-    const size_t route_plan_bytes = (2*n_routes + desc->n_expert + 1) * sizeof(int32_t);
-    if (ggml_nbytes(dst) < route_plan_bytes) {
+    const auto route_layout = ggml_cuda_expert_cache_route_layout(n_routes, desc->n_expert);
+    if (ggml_nbytes(dst) < route_layout.size) {
         return false;
     }
     if (dst->src[1] == nullptr || dst->src[1]->type != GGML_TYPE_I8 || !ggml_is_contiguous(dst->src[1])) {
@@ -142,16 +297,7 @@ bool ggml_cuda_expert_cache_supported(const ggml_tensor * dst) {
     if (desc->n_expert == 0 || desc->n_cache == 0 || desc->n_cache > desc->n_expert) {
         return false;
     }
-    int state_index = 1;
-    if (dst->src[2] != nullptr && dst->src[2]->type == GGML_TYPE_I8 &&
-            ggml_is_contiguous(dst->src[2]) && dst->src[2]->ne[0] == (int64_t) desc->state_size &&
-            dst->src[2]->ne[1] == 1 && dst->src[2]->ne[2] == 1 && dst->src[2]->ne[3] == 1) {
-        state_index = 2;
-        if (dst->src[1]->ne[0] != dst->src[0]->ne[1] || dst->src[1]->ne[1] != 1 ||
-                dst->src[1]->ne[2] != 1 || dst->src[1]->ne[3] != 1) {
-            return false;
-        }
-    }
+    const int state_index = 1;
     if (dst->src[state_index] == nullptr || ggml_nbytes(dst->src[state_index]) < desc->state_size) {
         return false;
     }
@@ -190,14 +336,7 @@ void ggml_cuda_expert_cache(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
 
     expert_cache_prepare_clock(desc);
 
-    int state_index = 1;
-    const ggml_tensor * policy_src = nullptr;
-    if (dst->src[2] != nullptr && dst->src[2]->type == GGML_TYPE_I8 &&
-            dst->src[2]->ne[0] == (int64_t) desc->state_size && dst->src[2]->ne[1] == 1 &&
-            dst->src[2]->ne[2] == 1 && dst->src[2]->ne[3] == 1) {
-        state_index = 2;
-        policy_src = dst->src[1];
-    }
+    const int state_index = 1;
 
     expert_cache_params params = {};
     params.n_expert = desc->n_expert;
@@ -234,10 +373,11 @@ void ggml_cuda_expert_cache(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
     ggml_cuda_expert_plan plan = {};
     plan.fill_expert = reinterpret_cast<int32_t *>(state_data + params.fill_expert_offset);
     plan.fill_slot = reinterpret_cast<int32_t *>(state_data + params.fill_slot_offset);
-    plan.cache_ids = static_cast<int32_t *>(dst->data);
+    const auto route_layout = ggml_cuda_expert_cache_route_layout(params.n_routes, desc->n_expert);
+    plan.cache_ids = reinterpret_cast<int32_t *>(static_cast<uint8_t *>(dst->data) + route_layout.selectors_offset);
     const size_t n_routes = params.n_routes;
-    plan.route_ids = reinterpret_cast<int32_t *>(static_cast<uint8_t *>(dst->data) + n_routes*sizeof(int32_t));
-    plan.route_bounds = plan.route_ids + n_routes;
+    plan.route_ids = reinterpret_cast<int32_t *>(static_cast<uint8_t *>(dst->data) + route_layout.route_ids_offset);
+    plan.route_bounds = reinterpret_cast<int32_t *>(static_cast<uint8_t *>(dst->data) + route_layout.route_bounds_offset);
     plan.expert_to_cache = reinterpret_cast<int32_t *>(state_data + params.expert_to_cache_offset);
     plan.cache_to_expert = reinterpret_cast<int32_t *>(state_data + params.cache_to_expert_offset);
     plan.last_used = reinterpret_cast<uint64_t *>(state_data + params.last_used_offset);
@@ -247,10 +387,8 @@ void ggml_cuda_expert_cache(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
     plan.n_miss = &header->n_misses;
     plan.n_fill = &header->n_fills;
     plan.n_evictions = &header->n_evictions;
-    plan.n_read_only = &header->n_read_only;
     plan.n_streamed = &header->n_streamed;
     plan.n_host_experts = &header->n_host_experts;
-    plan.policy = policy_src != nullptr ? static_cast<const uint8_t *>(policy_src->data) : nullptr;
 
     const int n_expert_used = dst->src[0]->ne[0];
     const int n_tokens = ggml_nelements(dst->src[0]) / n_expert_used;

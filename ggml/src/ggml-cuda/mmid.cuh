@@ -28,7 +28,6 @@ struct ggml_cuda_expert_plan {
     int32_t * fill_expert;
     int32_t * fill_slot;
     int32_t * cache_ids;
-    const uint8_t * policy;
 
     int32_t * expert_to_cache;
     int32_t * cache_to_expert;
@@ -40,7 +39,6 @@ struct ggml_cuda_expert_plan {
     uint32_t * n_miss;
     uint32_t * n_fill;
     uint32_t * n_evictions;
-    uint32_t * n_read_only;
     uint32_t * n_streamed;
     uint32_t * n_host_experts;
 };

@@ -133,15 +133,9 @@ static __global__ void expert_plan_cache(
     }
 
     int32_t n_active = 0;
-    int32_t n_read_only = 0;
     for (int64_t i = 0; i < n_ids; ++i) {
         const int32_t expert = ids[i];
         assert(expert >= 0 && expert < n_experts);
-        const bool update = plan.policy == nullptr || plan.policy[i / n_expert_used] == 1;
-        n_read_only += !update;
-        if (!update) {
-            continue;
-        }
         if (!requested[expert]) {
             requested[expert] = 1;
             unique[n_active++] = expert;
@@ -241,7 +235,6 @@ static __global__ void expert_plan_cache(
     *plan.n_miss = n_miss;
     *plan.n_fill = n_fill;
     *plan.n_evictions = n_evictions;
-    *plan.n_read_only = n_read_only;
     *plan.n_streamed = n_streamed;
     *plan.n_host_experts = n_host_experts;
 }
@@ -295,7 +288,6 @@ void ggml_cuda_launch_expert_cache_plan(
     GGML_ASSERT(plan.n_miss != nullptr);
     GGML_ASSERT(plan.n_fill != nullptr);
     GGML_ASSERT(plan.n_evictions != nullptr);
-    GGML_ASSERT(plan.n_read_only != nullptr);
     GGML_ASSERT(plan.n_streamed != nullptr);
     GGML_ASSERT(plan.n_host_experts != nullptr);
 

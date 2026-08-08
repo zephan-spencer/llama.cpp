@@ -58,6 +58,7 @@
 #include "ggml-cuda/upscale.cuh"
 #include "ggml-cuda/wkv.cuh"
 #include "ggml-cuda/gla.cuh"
+#include "ggml-cuda/expert-cache-private.cuh"
 #include "ggml-cuda/gated_delta_net.cuh"
 #include "ggml-cuda/dsv4-hc.cuh"
 #include "ggml-cuda/expert-cache.cuh"
@@ -1683,33 +1684,19 @@ static bool ggml_cuda_get_expert_source_view(
     view.host_data = static_cast<const char *>(source->weight->device_data) + source->weight->host_offset;
     view.host_stride = source->weight->expert_size / type_size;
     view.n_expert = source->n_expert;
-
-    // The cache planner stores the source selectors followed by the grouped
-    // route order and expert boundaries in one graph-managed output.  The
-    // selector tensor passed to MUL_MAT_ID is a zero-offset view of that
-    // output, so discover the parent custom node here and reuse its data.
-    const ggml_tensor * route_storage = ids_source;
-    while (route_storage != nullptr && route_storage->view_src != nullptr) {
-        route_storage = route_storage->view_src;
+    const auto * plan = static_cast<const ggml_backend_cuda_expert_plan_binding *>(ids_source->extra);
+    if (plan == nullptr) {
+        return true;
     }
-    if (route_storage != nullptr && route_storage->op == GGML_OP_CUSTOM) {
-        ggml_custom_op_params op_params;
-        memcpy(&op_params, route_storage->op_params, sizeof(op_params));
-        if (op_params.fun == nullptr && op_params.userdata != nullptr) {
-            const auto * desc = static_cast<const ggml_backend_cuda_expert_cache_desc *>(op_params.userdata);
-            if (desc->magic == GGML_CUDA_EXPERT_CACHE_MAGIC &&
-                    desc->version == GGML_CUDA_EXPERT_CACHE_VERSION) {
-                const int64_t n_routes = ggml_nelements(ids_source);
-                const size_t route_bytes = (size_t) n_routes * sizeof(int32_t);
-                const size_t required = (2*n_routes + source->n_expert + 1) * sizeof(int32_t);
-                GGML_ASSERT(ggml_nbytes(route_storage) >= required);
-
-                const char * data = static_cast<const char *>(route_storage->data);
-                view.route_ids = reinterpret_cast<const int32_t *>(data + route_bytes);
-                view.route_bounds = view.route_ids + n_routes;
-            }
-        }
-    }
+    GGML_ASSERT(plan->magic == GGML_CUDA_EXPERT_PLAN_MAGIC);
+    GGML_ASSERT(plan->cache != nullptr);
+    GGML_ASSERT(plan->cache == source->cache);
+    const auto & desc = plan->cache->desc;
+    GGML_ASSERT(desc.n_expert == source->n_expert);
+    const auto layout = ggml_cuda_expert_cache_route_layout(ggml_nelements(ids_source), desc.n_expert);
+    const char * data = static_cast<const char *>(ids_source->data);
+    view.route_ids = reinterpret_cast<const int32_t *>(data + layout.route_ids_offset);
+    view.route_bounds = reinterpret_cast<const int32_t *>(data + layout.route_bounds_offset);
     return true;
 }
 
@@ -5408,6 +5395,11 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     if (strcmp(name, "ggml_backend_get_features") == 0) {
         return (void *)ggml_backend_cuda_get_features;
     }
+#ifdef GGML_USE_HIP
+    if (strcmp(name, "ggml_backend_moe_cache_get_interface") == 0) {
+        return (void *)ggml_backend_cuda_moe_cache_get_interface;
+    }
+#endif
     return nullptr;
 }
 

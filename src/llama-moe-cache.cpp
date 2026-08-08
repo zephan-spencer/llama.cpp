@@ -4,17 +4,44 @@
 #include "llama-model.h"
 
 #include "ggml-alloc.h"
-#include "ggml-cuda.h"
 #include "ggml-cpp.h"
 
 #include <algorithm>
 #include <cinttypes>
-#include <cstddef>
-#include <cstdint>
+#include <cstring>
 #include <stdexcept>
 #include <unordered_map>
 #include <unordered_set>
-#include <utility>
+
+bool llama_moe_cache_is_routed_weight(llm_tensor tensor, const char * suffix) {
+    return suffix != nullptr && strcmp(suffix, "weight") == 0 &&
+        (tensor == LLM_TENSOR_FFN_DOWN_EXPS ||
+         tensor == LLM_TENSOR_FFN_GATE_EXPS ||
+         tensor == LLM_TENSOR_FFN_UP_EXPS ||
+         tensor == LLM_TENSOR_FFN_GATE_UP_EXPS);
+}
+
+void llama_moe_cache_validate_model(const llama_model & model, uint32_t n_cache) {
+    if (model.hparams.n_expert == 0) {
+        throw std::runtime_error("MoE expert cache: model has no routed experts");
+    }
+
+    if (n_cache < model.hparams.n_expert_used || n_cache >= model.hparams.n_expert) {
+        throw std::runtime_error("MoE expert cache: capacity must cover experts used per token and remain below total experts");
+    }
+
+    if (model.n_devices() != 1) {
+        throw std::runtime_error("MoE expert cache: exactly one GPU device is required");
+    }
+
+    if (model.n_gpu_layers() != model.hparams.n_layer_all + 1) {
+        throw std::runtime_error("MoE expert cache: every model layer requires GPU placement");
+    }
+
+    if (model.split_mode() == LLAMA_SPLIT_MODE_TENSOR) {
+        throw std::runtime_error("MoE expert cache: tensor parallelism requires a meta-device cache implementation");
+    }
+}
 
 struct llama_moe_expert_cache::impl {
     struct weight {
@@ -25,547 +52,304 @@ struct llama_moe_expert_cache::impl {
     struct group {
         int il;
         int32_t n_expert;
-        int32_t n_cache;
-
         ggml_backend_t backend;
         ggml_backend_buffer_type_t buft;
-
+        const ggml_backend_moe_cache_i * api;
+        ggml_backend_moe_cache_t handle = nullptr;
         ggml_context_ptr context;
         ggml_backend_buffer_ptr buffer;
         size_t buffer_size = 0;
         ggml_tensor * state = nullptr;
-
         std::vector<weight> weights;
-        std::vector<ggml_backend_cuda_expert_source> sources;
-        std::vector<int32_t> expert_to_cache;
-        std::vector<int32_t> cache_to_expert;
-        std::vector<uint64_t> last_used;
-        uint64_t use_clock = 0;
 
-        ggml_backend_cuda_expert_cache_desc device_desc = {};
-        bool device_resolver = false;
+        ~group() {
+            if (handle != nullptr) {
+                api->destroy(handle);
+            }
+        }
     };
 
     const llama_model & model;
-    std::vector<ggml_backend_t> backends;
+    const std::vector<ggml_backend_t> & backends;
+    uint32_t n_cache;
     std::vector<std::unique_ptr<group>> groups;
-    std::unordered_map<const ggml_tensor *, group *> groups_by_anchor;
-    std::unordered_set<ggml_backend_t> pending_backends;
-
-    ggml_backend_dev_t cache_device = nullptr;
-    uint32_t n_cache_experts;
+    std::unordered_map<const ggml_tensor *, group *> by_anchor;
+    std::unordered_set<ggml_backend_t> pending;
+    ggml_backend_dev_t device = nullptr;
     bool info_printed = false;
 
-    static size_t align_offset(size_t offset, size_t alignment) {
-        return (offset + alignment - 1) & ~(alignment - 1);
-    }
-
-    impl(
-            const llama_model & model,
-            const std::vector<ggml_backend_t> & backends,
-            uint32_t n_cache_experts) :
-        model(model),
-        backends(backends),
-        n_cache_experts(n_cache_experts) {
+    impl(const llama_model & model, const std::vector<ggml_backend_t> & backends, uint32_t n_cache)
+        : model(model), backends(backends), n_cache(n_cache) {
     }
 
     ggml_backend_t backend_for_layer(int il) const {
-        ggml_backend_dev_t device = model.dev_layer(il);
+        const ggml_backend_dev_t target = model.dev_layer(il);
         for (ggml_backend_t backend : backends) {
-            if (ggml_backend_get_device(backend) == device) {
+            if (ggml_backend_get_device(backend) == target) {
                 return backend;
             }
         }
         return nullptr;
     }
 
-    static std::vector<ggml_tensor *> expert_sources(
+    static std::vector<ggml_tensor *> sources(
             ggml_tensor * up,
             ggml_tensor * gate,
             ggml_tensor * down,
             ggml_tensor * gate_up) {
-        std::vector<ggml_tensor *> sources;
-        for (ggml_tensor * source : { gate_up, up, gate, down }) {
-            if (source != nullptr && std::find(sources.begin(), sources.end(), source) == sources.end()) {
-                sources.push_back(source);
+        std::vector<ggml_tensor *> result;
+        for (ggml_tensor * tensor : { gate_up, up, gate, down }) {
+            if (tensor != nullptr && std::find(result.begin(), result.end(), tensor) == result.end()) {
+                result.push_back(tensor);
             }
         }
-        return sources;
+        return result;
     }
 
-    group * create_group(
-            int il,
-            const std::vector<ggml_tensor *> & sources) {
-        if (sources.empty()) {
-            throw std::runtime_error("MoE expert cache: no expert weights");
+    static const ggml_backend_moe_cache_i * api_for(ggml_backend_dev_t device) {
+        ggml_backend_reg_t registry = ggml_backend_dev_backend_reg(device);
+        auto get_interface = reinterpret_cast<ggml_backend_moe_cache_get_interface_t>(
+            ggml_backend_reg_get_proc_address(registry, "ggml_backend_moe_cache_get_interface"));
+        const ggml_backend_moe_cache_i * api = get_interface ? get_interface() : nullptr;
+        return api != nullptr && api->version == GGML_BACKEND_MOE_CACHE_INTERFACE_VERSION && api->supports(device)
+            ? api
+            : nullptr;
+    }
+
+    group * create(int il, const std::vector<ggml_tensor *> & source_tensors) {
+        if (source_tensors.empty()) {
+            throw std::runtime_error("MoE expert cache: no routed expert weights");
         }
 
-        const int64_t n_expert = sources.front()->ne[2];
-        if (il < 0 || n_expert <= 0 || n_cache_experts > (uint64_t) n_expert) {
-            throw std::runtime_error("MoE expert cache: invalid layer or expert count");
+        const int64_t n_expert = source_tensors.front()->ne[2];
+        if (n_expert <= 0 || n_cache == 0 || n_cache >= static_cast<uint64_t>(n_expert)) {
+            throw std::runtime_error("MoE expert cache: invalid capacity");
         }
 
         ggml_backend_t backend = backend_for_layer(il);
-        if (backend == nullptr) {
-            throw std::runtime_error("MoE expert cache: failed to find the layer backend");
+        ggml_backend_dev_t layer_device = backend ? ggml_backend_get_device(backend) : nullptr;
+        if (backend == nullptr || layer_device == nullptr || ggml_backend_dev_type(layer_device) != GGML_BACKEND_DEVICE_TYPE_GPU) {
+            throw std::runtime_error("MoE expert cache: every routed layer requires GPU placement");
         }
 
-        ggml_backend_dev_t device = ggml_backend_get_device(backend);
-        if (device == nullptr || ggml_backend_dev_type(device) != GGML_BACKEND_DEVICE_TYPE_GPU) {
-            throw std::runtime_error("MoE expert cache: layer backend is not a GPU");
-        }
-        if (cache_device != nullptr && cache_device != device) {
-            throw std::runtime_error("MoE expert cache: multiple cache devices are not supported");
-        }
-        cache_device = device;
-
-        for (const ggml_tensor * source : sources) {
-            if (source->ne[2] != n_expert || source->ne[3] != 1) {
-                throw std::runtime_error("MoE expert cache: incompatible expert tensor dimensions");
-            }
-            if (source->buffer == nullptr || !ggml_backend_buffer_is_host(source->buffer)) {
-                throw std::runtime_error("MoE expert cache: expert weights must be host resident");
-            }
-            if (!model.hparams.no_alloc && source->data == nullptr) {
-                throw std::runtime_error("MoE expert cache: expert weight data is unavailable");
-            }
+        const ggml_backend_moe_cache_i * api = api_for(layer_device);
+        if (api == nullptr) {
+            throw std::runtime_error("MoE expert cache: the selected backend lacks expert-cache support");
         }
 
-        const bool needs_planner_state = n_cache_experts < (uint64_t) n_expert;
-        const ggml_init_params params = {
-            /*.mem_size   =*/ (sources.size() + 1) * ggml_tensor_overhead(),
-            /*.mem_buffer =*/ nullptr,
-            /*.no_alloc   =*/ true,
-        };
+        if (device != nullptr && device != layer_device) {
+            throw std::runtime_error("MoE expert cache: every cached layer requires one backend device");
+        }
+        device = layer_device;
+
+        if (source_tensors.size() > GGML_BACKEND_MOE_CACHE_MAX_WEIGHTS) {
+            throw std::runtime_error("MoE expert cache: too many routed projections");
+        }
+
+        for (ggml_tensor * tensor : source_tensors) {
+            if (tensor->ne[2] != n_expert || tensor->ne[3] != 1 || tensor->buffer == nullptr ||
+                    !ggml_backend_buffer_is_host(tensor->buffer)) {
+                throw std::runtime_error("MoE expert cache: routed expert weights require complete host-resident tensors");
+            }
+        }
 
         auto result = std::make_unique<group>();
         result->il = il;
         result->n_expert = n_expert;
-        result->n_cache = n_cache_experts;
         result->backend = backend;
         result->buft = ggml_backend_get_default_buffer_type(backend);
-        result->context.reset(ggml_init(params));
-        if (!result->context) {
-            throw std::runtime_error("MoE expert cache: failed to create tensor context");
+        result->api = api;
+
+        const size_t state_size = api->get_state_size(n_expert, n_cache, source_tensors.size());
+        if (state_size == 0) {
+            throw std::runtime_error("MoE expert cache: backend rejected cache configuration");
         }
 
-        for (ggml_tensor * source : sources) {
-            const int64_t ne[4] = { source->ne[0], source->ne[1], (int64_t) n_cache_experts, 1 };
-            ggml_tensor * slots = ggml_new_tensor(result->context.get(), source->type, 4, ne);
-            for (int i = 0; i < GGML_MAX_DIMS; ++i) {
-                slots->nb[i] = source->nb[i];
+        result->context.reset(ggml_init({
+            (source_tensors.size() + 1)*ggml_tensor_overhead(),
+            nullptr,
+            true,
+        }));
+
+        for (ggml_tensor * tensor : source_tensors) {
+            const int64_t ne[4] = { tensor->ne[0], tensor->ne[1], static_cast<int64_t>(n_cache), 1 };
+            ggml_tensor * slots = ggml_new_tensor(result->context.get(), tensor->type, 4, ne);
+            for (int dimension = 0; dimension < GGML_MAX_DIMS; ++dimension) {
+                slots->nb[dimension] = tensor->nb[dimension];
             }
-            ggml_format_name(slots, "%s#moe_cache", source->name);
-            result->weights.push_back({ source, slots });
-        }
-        result->sources.resize(result->weights.size());
-        for (size_t i = 0; i < result->sources.size(); ++i) {
-            result->sources[i] = {
-                GGML_CUDA_EXPERT_SOURCE_MAGIC,
-                (uint32_t) result->n_expert,
-                nullptr,
-            };
-            result->weights[i].slots->extra = &result->sources[i];
+            ggml_format_name(slots, "%s#moe_cache", tensor->name);
+            result->weights.push_back({ tensor, slots });
         }
 
-        size_t state_offset = sizeof(ggml_backend_cuda_expert_cache_state);
-        if (needs_planner_state) {
-            result->device_desc.expert_to_cache_offset = align_offset(state_offset, alignof(int32_t));
-            state_offset = result->device_desc.expert_to_cache_offset + n_expert * sizeof(int32_t);
-            result->device_desc.cache_to_expert_offset = align_offset(state_offset, alignof(int32_t));
-            state_offset = result->device_desc.cache_to_expert_offset + n_cache_experts * sizeof(int32_t);
-            result->device_desc.last_used_offset = align_offset(state_offset, alignof(uint64_t));
-            state_offset = result->device_desc.last_used_offset + n_cache_experts * sizeof(uint64_t);
-            result->device_desc.fill_expert_offset = align_offset(state_offset, alignof(int32_t));
-            state_offset = result->device_desc.fill_expert_offset + n_cache_experts * sizeof(int32_t);
-            result->device_desc.fill_slot_offset = align_offset(state_offset, alignof(int32_t));
-            state_offset = result->device_desc.fill_slot_offset + n_cache_experts * sizeof(int32_t);
-        }
-        result->device_desc.state_size = align_offset(state_offset, GGML_MEM_ALIGN);
-
-        result->state = ggml_new_tensor_1d(
-            result->context.get(), GGML_TYPE_I8, result->device_desc.state_size);
+        result->state = ggml_new_tensor_1d(result->context.get(), GGML_TYPE_I8, state_size);
         ggml_format_name(result->state, "blk.%d.moe_cache_state", il);
-
-        result->buffer_size = ggml_backend_alloc_ctx_tensors_from_buft_size(
-            result->context.get(), result->buft);
+        result->buffer_size = ggml_backend_alloc_ctx_tensors_from_buft_size(result->context.get(), result->buft);
 
         if (!model.hparams.no_alloc) {
             result->buffer.reset(ggml_backend_alloc_ctx_tensors(result->context.get(), backend));
             if (!result->buffer) {
                 throw std::runtime_error("MoE expert cache: failed to allocate device cache");
             }
+
             ggml_backend_buffer_set_usage(result->buffer.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
             ggml_backend_buffer_clear(result->buffer.get(), 0);
+
+            std::vector<ggml_tensor *> sources;
+            std::vector<ggml_tensor *> slots;
+            for (const weight & entry : result->weights) {
+                sources.push_back(const_cast<ggml_tensor *>(entry.source));
+                slots.push_back(entry.slots);
+            }
+
+            result->handle = api->create(backend, result->state, sources.data(), slots.data(), n_expert, n_cache, sources.size());
+            if (result->handle == nullptr) {
+                throw std::runtime_error("MoE expert cache: backend failed to create cache handle");
+            }
+
+            pending.insert(backend);
             result->buffer_size = ggml_backend_buffer_get_size(result->buffer.get());
-
-            {
-                std::vector<uint8_t> state_data(result->device_desc.state_size, 0);
-                if (needs_planner_state) {
-                    auto * expert_to_cache = reinterpret_cast<int32_t *>(
-                        state_data.data() + result->device_desc.expert_to_cache_offset);
-                    auto * cache_to_expert = reinterpret_cast<int32_t *>(
-                        state_data.data() + result->device_desc.cache_to_expert_offset);
-                    std::fill(expert_to_cache, expert_to_cache + n_expert, -1);
-                    std::fill(cache_to_expert, cache_to_expert + n_cache_experts, -1);
-                }
-                ggml_backend_tensor_set(
-                    result->state, state_data.data(), 0, result->device_desc.state_size);
-            }
-            pending_backends.insert(backend);
-        }
-
-        result->expert_to_cache.assign(n_expert, -1);
-        result->cache_to_expert.assign(n_cache_experts, -1);
-        result->last_used.assign(n_cache_experts, 0);
-
-        result->device_desc.magic = GGML_CUDA_EXPERT_CACHE_MAGIC;
-        result->device_desc.version = GGML_CUDA_EXPERT_CACHE_VERSION;
-        result->device_desc.n_expert = n_expert;
-        result->device_desc.n_cache = n_cache_experts;
-        result->device_desc.n_weights = result->weights.size();
-
-        for (size_t i = 0; i < result->sources.size(); ++i) {
-            result->sources[i].weight = &result->device_desc.weights[i];
-        }
-
-        if (!model.hparams.no_alloc && needs_planner_state) {
-            ggml_backend_buffer_type_t host_buft = ggml_backend_dev_host_buffer_type(device);
-            for (size_t i = 0; i < result->weights.size(); ++i) {
-                const weight & cached = result->weights[i];
-                if (ggml_backend_buffer_get_type(cached.source->buffer) != host_buft) {
-                    result->device_desc.magic = 0;
-                    break;
-                }
-
-                const uint8_t * host_base = static_cast<const uint8_t *>(
-                    ggml_backend_buffer_get_base(cached.source->buffer));
-                result->device_desc.weights[i].host_data = host_base;
-                result->device_desc.weights[i].host_offset =
-                    static_cast<const uint8_t *>(cached.source->data) - host_base;
-                result->device_desc.weights[i].expert_size = cached.source->nb[2];
-            }
-        }
-
-        if (!model.hparams.no_alloc && n_cache_experts == (uint64_t) n_expert) {
-            for (int32_t expert = 0; expert < n_expert; ++expert) {
-                result->expert_to_cache[expert] = expert;
-                result->cache_to_expert[expert] = expert;
-            }
-            for (const weight & cached : result->weights) {
-                ggml_backend_tensor_set_async(
-                    backend,
-                    cached.slots,
-                    cached.source->data,
-                    0,
-                    ggml_nbytes(cached.slots));
-            }
-            pending_backends.insert(backend);
         }
 
         group * value = result.get();
-        groups_by_anchor.emplace(sources.front(), value);
+        by_anchor.emplace(source_tensors.front(), value);
         groups.push_back(std::move(result));
         return value;
     }
 
-    group * find_or_create_group(
-            int il,
-            const std::vector<ggml_tensor *> & sources) {
-        if (sources.empty()) {
-            throw std::runtime_error("MoE expert cache: no expert weights");
-        }
-        auto it = groups_by_anchor.find(sources.front());
-        return it == groups_by_anchor.end() ? create_group(il, sources) : it->second;
+    group * find(int il, const std::vector<ggml_tensor *> & source_tensors) {
+        const auto it = by_anchor.find(source_tensors.front());
+        return it == by_anchor.end() ? create(il, source_tensors) : it->second;
     }
 
-    static ggml_tensor * cached_weight(group * cache_group, ggml_tensor * source) {
+    static ggml_tensor * cached(group * group, ggml_tensor * source) {
         if (source == nullptr) {
             return nullptr;
         }
-        for (const weight & cached : cache_group->weights) {
-            if (cached.source == source) {
-                return cached.slots;
-            }
-        }
-        GGML_ABORT("MoE expert cache: weight is not part of the cache group");
-    }
 
-    void print_stats() const {
-        if (model.hparams.no_alloc) {
-            return;
-        }
-
-        uint64_t total_resolve_calls = 0;
-        uint64_t total_update_touches = 0;
-        uint64_t total_read_only_touches = 0;
-        uint64_t total_resident_routes = 0;
-        uint64_t total_streamed_routes = 0;
-        uint64_t total_cache_hits = 0;
-        uint64_t total_cache_misses = 0;
-        uint64_t total_evictions = 0;
-        uint64_t total_h2d_bytes = 0;
-        uint64_t total_host_expert_bytes = 0;
-        double total_fill_ms = 0.0;
-
-        for (const auto & cache_group : groups) {
-            if (!cache_group->device_resolver) {
-                continue;
-            }
-
-            ggml_backend_cuda_expert_cache_state state = {};
-            ggml_backend_tensor_get(cache_group->state, &state, 0, sizeof(state));
-            total_resolve_calls += state.stats.resolve_calls;
-            total_update_touches += state.stats.update_touches;
-            total_read_only_touches += state.stats.read_only_touches;
-            total_resident_routes += state.stats.resident_routes;
-            total_streamed_routes += state.stats.streamed_routes;
-            total_cache_hits += state.stats.cache_hits;
-            total_cache_misses += state.stats.cache_misses;
-            total_evictions += state.stats.evictions;
-            total_h2d_bytes += state.stats.h2d_bytes;
-            total_host_expert_bytes += state.stats.host_expert_bytes;
-            const uint64_t wall_clock_hz = cache_group->device_desc.wall_clock_hz;
-            if (wall_clock_hz > 0) {
-                total_fill_ms += state.stats.fill_ticks * 1000.0 / wall_clock_hz;
+        for (const weight & entry : group->weights) {
+            if (entry.source == source) {
+                return entry.slots;
             }
         }
 
-        LLAMA_LOG_INFO(
-            "MoE expert cache: resolves = %" PRIu64 ", updates = %" PRIu64
-            ", read-only routes = %" PRIu64 ", resident routes = %" PRIu64
-            ", streamed routes = %" PRIu64 ", hits = %" PRIu64 ", misses = %" PRIu64
-            ", evictions = %" PRIu64 ", H2D = %.2f MiB, host expert bytes = %.2f MiB, fill = %.2f ms\n",
-            total_resolve_calls,
-            total_update_touches,
-            total_read_only_touches,
-            total_resident_routes,
-            total_streamed_routes,
-            total_cache_hits,
-            total_cache_misses,
-            total_evictions,
-            total_h2d_bytes / 1024.0 / 1024.0,
-            total_host_expert_bytes / 1024.0 / 1024.0,
-            total_fill_ms);
-    }
-
-    void reset_stats() {
-        const ggml_backend_cuda_expert_cache_stats zero = {};
-        for (const auto & cache_group : groups) {
-            if (cache_group->device_resolver) {
-                ggml_backend_tensor_set_async(
-                    cache_group->backend,
-                    cache_group->state,
-                    &zero,
-                    offsetof(ggml_backend_cuda_expert_cache_state, stats),
-                    sizeof(zero));
-            }
-        }
+        GGML_ABORT("MoE expert cache: missing source");
     }
 };
 
 llama_moe_expert_cache::llama_moe_expert_cache(
         const llama_model & model,
         const std::vector<ggml_backend_t> & backends,
-        uint32_t n_cache_experts) :
-    pimpl(std::make_unique<impl>(model, backends, n_cache_experts)) {
-    if (model.hparams.n_expert == 0) {
-        throw std::runtime_error("MoE expert cache: model has no routed experts");
-    }
-    if (n_cache_experts < model.hparams.n_expert_used) {
-        throw std::runtime_error(
-            "MoE expert cache: capacity must be at least the number of experts used per token (" +
-            std::to_string(model.hparams.n_expert_used) + ")");
-    }
-    if (n_cache_experts >= model.hparams.n_expert) {
-        throw std::runtime_error(
-            "MoE expert cache: capacity must be smaller than the model expert count (" +
-            std::to_string(model.hparams.n_expert) +
-            "); omit --moe-cache-experts when all experts fit in VRAM");
-    }
-    if (model.split_mode() == LLAMA_SPLIT_MODE_TENSOR) {
-        throw std::runtime_error("MoE expert cache: tensor parallelism is not supported");
-    }
-    LLAMA_LOG_INFO(
-        "%s: capacity = %u / %u routed experts per host-backed MoE layer\n",
-        __func__, n_cache_experts, model.hparams.n_expert);
+        uint32_t n_cache)
+    : pimpl(std::make_unique<impl>(model, backends, n_cache)) {
+    llama_moe_cache_validate_model(model, n_cache);
 }
 
-llama_moe_expert_cache::~llama_moe_expert_cache() {
-}
+llama_moe_expert_cache::~llama_moe_expert_cache() = default;
 
 llama_moe_cache_binding llama_moe_expert_cache::bind(
         ggml_context * ctx,
         ggml_backend_sched_t sched,
         int il,
         ggml_tensor * ids,
-        ggml_tensor * policy,
         ggml_tensor * up,
         ggml_tensor * gate,
         ggml_tensor * down,
         ggml_tensor * gate_up) {
-    const std::vector<ggml_tensor *> sources = impl::expert_sources(up, gate, down, gate_up);
-
-    ggml_backend_t backend = pimpl->backend_for_layer(il);
-    if (backend == nullptr) {
-        throw std::runtime_error("MoE expert cache: failed to find the layer backend");
-    }
-    ggml_backend_dev_t device = ggml_backend_get_device(backend);
-    if (device == nullptr || ggml_backend_dev_type(device) != GGML_BACKEND_DEVICE_TYPE_GPU) {
-        throw std::runtime_error("MoE expert cache: routed expert layer is not assigned to a GPU");
-    }
-    bool all_on_device = !sources.empty();
-    bool all_on_host = !sources.empty();
-    for (const ggml_tensor * source : sources) {
-        all_on_device = all_on_device &&
-            source->buffer != nullptr &&
-            !ggml_backend_buffer_is_host(source->buffer) &&
-            ggml_backend_buft_get_device(ggml_backend_buffer_get_type(source->buffer)) == device;
-        all_on_host = all_on_host &&
-            source->buffer != nullptr &&
-            ggml_backend_buffer_is_host(source->buffer);
-    }
-    if (all_on_device) {
-        throw std::runtime_error("MoE expert cache: routed expert weights are not host resident");
-    }
-    if (!all_on_host) {
-        throw std::runtime_error("MoE expert cache: routed expert weights have mixed placement");
-    }
-
-    impl::group * cache_group = pimpl->find_or_create_group(il, sources);
-
+    impl::group * group = pimpl->find(il, impl::sources(up, gate, down, gate_up));
     if (pimpl->model.hparams.no_alloc) {
-        return {
-            /*.up      =*/ up,
-            /*.gate    =*/ gate,
-            /*.down    =*/ down,
-            /*.gate_up =*/ gate_up,
-            /*.ids     =*/ ids,
-        };
+        return { up, gate, down, gate_up, ids };
     }
 
-    if (pimpl->n_cache_experts == (uint64_t) cache_group->n_expert) {
-        return {
-            /*.up      =*/ impl::cached_weight(cache_group, up),
-            /*.gate    =*/ impl::cached_weight(cache_group, gate),
-            /*.down    =*/ impl::cached_weight(cache_group, down),
-            /*.gate_up =*/ impl::cached_weight(cache_group, gate_up),
-            /*.ids     =*/ ids,
-        };
+    ggml_tensor * logical_ids = ggml_is_contiguous(ids) ? ids : ggml_cont(ctx, ids);
+    const ggml_backend_moe_cache_plan plan = group->api->build_plan(group->handle, ctx, logical_ids);
+    if (plan.execution == nullptr || plan.selectors == nullptr ||
+            !ggml_backend_dev_supports_op(ggml_backend_get_device(group->backend), plan.execution)) {
+        throw std::runtime_error("MoE expert cache: backend cannot build route plan");
     }
 
-    ggml_tensor * ids_cont = ggml_is_contiguous(ids) ? ids : ggml_cont(ctx, ids);
-
-    if (cache_group->state != nullptr && cache_group->device_desc.magic == GGML_CUDA_EXPERT_CACHE_MAGIC) {
-        const int state_index = policy != nullptr ? 2 : 1;
-        ggml_tensor * args[3 + GGML_CUDA_EXPERT_CACHE_MAX_WEIGHTS] = {};
-        args[0] = ids_cont;
-        if (policy != nullptr) {
-            args[1] = policy;
-        }
-        args[state_index] = cache_group->state;
-        for (size_t i = 0; i < cache_group->weights.size(); ++i) {
-            args[state_index + 1 + i] = cache_group->weights[i].slots;
-        }
-
-        const int64_t n_routes = ggml_nelements(ids_cont);
-        const int64_t route_storage_size = 2*n_routes + cache_group->n_expert + 1;
-        ggml_tensor * cache_plan = ggml_custom_4d(
-            ctx,
-            GGML_TYPE_I32,
-            route_storage_size,
-            1,
-            1,
-            1,
-            args,
-            state_index + 1 + cache_group->weights.size(),
-            nullptr,
-            1,
-            &cache_group->device_desc);
-
-        if (ggml_backend_dev_supports_op(device, cache_plan)) {
-            // The first region is the selector tensor consumed by
-            // MUL_MAT_ID.  The cache-plan backend fills the following route
-            // order and boundary regions in the same allocation.
-            ggml_tensor * cache_ids = ggml_view_4d(
-                ctx,
-                cache_plan,
-                ids_cont->ne[0], ids_cont->ne[1], ids_cont->ne[2], ids_cont->ne[3],
-                ids_cont->nb[1], ids_cont->nb[2], ids_cont->nb[3],
-                0);
-            ggml_format_name(cache_plan, "blk.%d.moe_cache_plan", il);
-            ggml_format_name(cache_ids, "blk.%d.moe_cache_ids", il);
-            ggml_backend_sched_set_tensor_backend(sched, cache_plan, backend);
-            ggml_backend_sched_set_tensor_backend(sched, cache_ids, backend);
-            if (policy != nullptr) {
-                ggml_backend_sched_set_tensor_backend(sched, policy, backend);
-            }
-            cache_group->device_resolver = true;
-            return {
-                /*.up      =*/ impl::cached_weight(cache_group, up),
-                /*.gate    =*/ impl::cached_weight(cache_group, gate),
-                /*.down    =*/ impl::cached_weight(cache_group, down),
-                /*.gate_up =*/ impl::cached_weight(cache_group, gate_up),
-                /*.ids     =*/ cache_ids,
-            };
-        }
-    }
+    ggml_format_name(plan.execution, "blk.%d.moe_cache_plan", il);
+    ggml_format_name(plan.selectors, "blk.%d.moe_cache_ids", il);
+    ggml_backend_sched_set_tensor_backend(sched, plan.execution, group->backend);
+    ggml_backend_sched_set_tensor_backend(sched, plan.selectors, group->backend);
 
     return {
-        /*.up      =*/ up,
-        /*.gate    =*/ gate,
-        /*.down    =*/ down,
-        /*.gate_up =*/ gate_up,
-        /*.ids     =*/ ids,
+        impl::cached(group, up),
+        impl::cached(group, gate),
+        impl::cached(group, down),
+        impl::cached(group, gate_up),
+        plan.selectors,
     };
 }
 
 void llama_moe_expert_cache::synchronize() {
-    for (ggml_backend_t backend : pimpl->pending_backends) {
+    for (ggml_backend_t backend : pimpl->pending) {
         ggml_backend_synchronize(backend);
     }
-    pimpl->pending_backends.clear();
+    pimpl->pending.clear();
 }
 
 void llama_moe_expert_cache::print_info() {
-    if (pimpl->info_printed) {
+    if (pimpl->info_printed || pimpl->groups.empty()) {
         return;
     }
     pimpl->info_printed = true;
 
-    if (pimpl->groups.empty()) {
-        throw std::runtime_error("MoE expert cache: model has no supported routed expert layers");
-    }
-
     size_t total = 0;
     size_t host = 0;
-    for (const auto & cache_group : pimpl->groups) {
-        total += cache_group->buffer_size;
-        for (const auto & cached : cache_group->weights) {
-            host += ggml_nbytes(cached.source);
+    for (const auto & group : pimpl->groups) {
+        total += group->buffer_size;
+        for (const impl::weight & weight : group->weights) {
+            host += ggml_nbytes(weight.source);
         }
     }
-    LLAMA_LOG_INFO(
-        "MoE expert cache: host expert weights = %.2f MiB, GPU cache = %.2f MiB, experts = %u / %u, layers = %zu\n",
-        host / 1024.0 / 1024.0,
-        total / 1024.0 / 1024.0,
-        pimpl->n_cache_experts,
-        pimpl->model.hparams.n_expert,
-        pimpl->groups.size());
+
+    LLAMA_LOG_INFO("MoE expert cache: host expert weights = %.2f MiB, GPU cache = %.2f MiB, experts = %u / %u, layers = %zu\n",
+        host/1048576.0, total/1048576.0, pimpl->n_cache, pimpl->model.hparams.n_expert, pimpl->groups.size());
 }
 
 void llama_moe_expert_cache::print_stats() const {
-    pimpl->print_stats();
+    ggml_backend_moe_cache_stats total = {};
+    double fill_ms = 0.0;
+
+    for (const auto & group : pimpl->groups) {
+        if (group->handle == nullptr) {
+            continue;
+        }
+
+        ggml_backend_moe_cache_stats stats = {};
+        group->api->get_stats(group->handle, &stats);
+        total.resolve_calls += stats.resolve_calls;
+        total.update_touches += stats.update_touches;
+        total.resident_routes += stats.resident_routes;
+        total.streamed_routes += stats.streamed_routes;
+        total.cache_hits += stats.cache_hits;
+        total.cache_misses += stats.cache_misses;
+        total.evictions += stats.evictions;
+        total.h2d_bytes += stats.h2d_bytes;
+        total.host_expert_bytes += stats.host_expert_bytes;
+        if (stats.wall_clock_hz != 0) {
+            fill_ms += 1000.0*stats.fill_ticks/stats.wall_clock_hz;
+        }
+    }
+
+    LLAMA_LOG_INFO("MoE expert cache: resolves = %" PRIu64 ", resident routes = %" PRIu64 ", streamed routes = %" PRIu64 ", hits = %" PRIu64 ", misses = %" PRIu64 ", evictions = %" PRIu64 ", H2D = %.2f MiB, host reads = %.2f MiB, fill = %.3f ms\n",
+        total.resolve_calls, total.resident_routes, total.streamed_routes, total.cache_hits,
+        total.cache_misses, total.evictions, total.h2d_bytes/1048576.0,
+        total.host_expert_bytes/1048576.0, fill_ms);
 }
 
 void llama_moe_expert_cache::reset_stats() {
-    pimpl->reset_stats();
+    for (const auto & group : pimpl->groups) {
+        if (group->handle != nullptr) {
+            group->api->reset_stats(group->handle);
+        }
+    }
 }
 
 std::map<ggml_backend_buffer_type_t, size_t> llama_moe_expert_cache::memory_breakdown() const {
     std::map<ggml_backend_buffer_type_t, size_t> result;
-    for (const auto & cache_group : pimpl->groups) {
-        result[cache_group->buft] += cache_group->buffer_size;
+    for (const auto & group : pimpl->groups) {
+        result[group->buft] += group->buffer_size;
     }
     return result;
 }

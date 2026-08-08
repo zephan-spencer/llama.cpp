@@ -9,6 +9,7 @@
 #include "llama-model-loader.h"
 #include "llama-model-saver.h"
 #include "llama-model.h"
+#include "llama-moe-cache.h"
 
 #include "ggml.h"
 #include "ggml-cpp.h"
@@ -334,29 +335,7 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
             throw std::runtime_error("error loading model hyperparameters: " + std::string(e.what()));
         }
         if (params.n_moe_cache_experts > 0) {
-            if (model->hparams.n_expert == 0) {
-                throw std::runtime_error("MoE expert cache: model has no routed experts");
-            }
-            if (params.n_moe_cache_experts < model->hparams.n_expert_used) {
-                throw std::runtime_error(
-                    "MoE expert cache: capacity must be at least the number of experts used per token (" +
-                    std::to_string(model->hparams.n_expert_used) + ")");
-            }
-            if (params.n_moe_cache_experts >= model->hparams.n_expert) {
-                throw std::runtime_error(
-                    "MoE expert cache: capacity must be smaller than the model expert count (" +
-                    std::to_string(model->hparams.n_expert) +
-                    "); omit --moe-cache-experts when all experts fit in VRAM");
-            }
-            if (model->n_devices() != 1) {
-                throw std::runtime_error("MoE expert cache: exactly one GPU device is required");
-            }
-            if (model->n_gpu_layers() != model->hparams.n_layer_all + 1) {
-                throw std::runtime_error("MoE expert cache: all model layers must be offloaded to the GPU");
-            }
-            if (model->split_mode() == LLAMA_SPLIT_MODE_TENSOR) {
-                throw std::runtime_error("MoE expert cache: tensor parallelism is not supported");
-            }
+            llama_moe_cache_validate_model(*model, params.n_moe_cache_experts);
         }
         if (model->arch == LLM_ARCH_CLIP) {
             throw std::runtime_error("CLIP cannot be used as main model, use it with --mmproj instead");

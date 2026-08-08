@@ -90,14 +90,6 @@ bool llm_graph_input_embd::can_reuse(const llm_graph_params & params) {
     return res;
 }
 
-void llm_graph_input_moe_cache_policy::set_input(const llama_ubatch * ubatch) {
-    ggml_backend_tensor_set(policy, ubatch->moe_cache_policy, 0, ubatch->n_tokens);
-}
-
-bool llm_graph_input_moe_cache_policy::can_reuse(const llm_graph_params & params) {
-    return policy && policy->ne[0] == params.ubatch.n_tokens;
-}
-
 void llm_graph_input_embd_h::set_input(const llama_ubatch * ubatch) {
     const int64_t n_tokens = ubatch->n_tokens;
 
@@ -1200,7 +1192,6 @@ int64_t llm_graph_result::get_max_nodes() const {
 void llm_graph_result::reset() {
     t_inp_tokens  = nullptr;
     t_inp_embd    = nullptr;
-    t_inp_moe_cache_policy = nullptr;
     t_logits      = nullptr;
     t_embd        = nullptr;
     t_embd_pooled = nullptr;
@@ -1979,15 +1970,6 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
     cur = ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens);
 
-    const bool cache_has_policy = llm_graph_has_moe_cache_policy(ubatch);
-    if (moe_cache != nullptr && cache_has_policy && res->t_inp_moe_cache_policy == nullptr) {
-        auto input = std::make_unique<llm_graph_input_moe_cache_policy>();
-        input->policy = ggml_new_tensor_1d(ctx0, GGML_TYPE_I8, n_tokens);
-        ggml_set_input(input->policy);
-        ggml_set_name(input->policy, "moe_cache_policy");
-        res->t_inp_moe_cache_policy = input->policy;
-        res->add_input(std::move(input));
-    }
     llama_moe_cache_binding cache_binding = {
         /*.up      =*/ up_exps,
         /*.gate    =*/ gate_exps,
@@ -1998,7 +1980,6 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     if (moe_cache != nullptr) {
         cache_binding = moe_cache->bind(
             ctx0, sched, il, selected_experts,
-            cache_has_policy ? res->t_inp_moe_cache_policy : nullptr,
             up_exps, gate_exps, down_exps, gate_up_exps);
         cb(cache_binding.ids, "ffn_moe_cache_ids", il);
     }

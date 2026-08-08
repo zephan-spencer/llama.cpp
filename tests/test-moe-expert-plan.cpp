@@ -1,5 +1,6 @@
 #include "ggml-backend.h"
 #include "ggml-cuda.h"
+#include "expert-cache-private.cuh"
 #include "ggml-cpp.h"
 
 #include <hip/hip_runtime_api.h>
@@ -65,7 +66,6 @@ struct test_case {
     std::vector<int32_t> cache_to_expert;
     std::vector<uint64_t> last_used;
     uint64_t use_clock = 0;
-    std::vector<uint8_t> policy;
 };
 
 struct plan_result {
@@ -85,7 +85,6 @@ struct plan_result {
     uint32_t n_miss = 0;
     uint32_t n_fill = 0;
     uint32_t n_evictions = 0;
-    uint32_t n_read_only = 0;
     uint32_t n_streamed = 0;
     uint32_t n_host_experts = 0;
 };
@@ -137,11 +136,6 @@ static plan_result make_reference(const test_case & test) {
     std::vector<int32_t> unique;
     for (int32_t route = 0; route < n_ids; ++route) {
         const int32_t expert = test.ids[route];
-        const bool update = test.policy.empty() || test.policy[route / test.n_expert_used] == 1;
-        result.n_read_only += !update;
-        if (!update) {
-            continue;
-        }
         if (!requested[expert]) {
             requested[expert] = true;
             unique.push_back(expert);
@@ -243,8 +237,7 @@ static void run_case(const test_case & test, hipStream_t stream) {
     const int32_t n_ids = test.n_tokens * test.n_expert_used;
     if ((int32_t) test.ids.size() != n_ids ||
             (int32_t) test.cache_to_expert.size() != test.n_cache ||
-            (int32_t) test.last_used.size() != test.n_cache ||
-            (!test.policy.empty() && (int32_t) test.policy.size() != test.n_tokens)) {
+            (int32_t) test.last_used.size() != test.n_cache) {
         throw std::runtime_error(test.name + ": invalid test data");
     }
 
@@ -252,7 +245,6 @@ static void run_case(const test_case & test, hipStream_t stream) {
     const std::vector<int32_t> initial_expert_to_cache = make_expert_to_cache(test);
 
     device_buffer<int32_t> ids(n_ids);
-    device_buffer<uint8_t> policy(test.n_tokens);
     device_buffer<int32_t> ids_src(n_ids);
     device_buffer<int32_t> ids_dst(n_ids);
     device_buffer<int32_t> expert_bounds(test.n_expert + 1);
@@ -271,7 +263,6 @@ static void run_case(const test_case & test, hipStream_t stream) {
     device_buffer<uint32_t> n_miss(1);
     device_buffer<uint32_t> n_fill(1);
     device_buffer<uint32_t> n_evictions(1);
-    device_buffer<uint32_t> n_read_only(1);
     device_buffer<uint32_t> n_streamed(1);
     device_buffer<uint32_t> n_host_experts(1);
 
@@ -280,7 +271,6 @@ static void run_case(const test_case & test, hipStream_t stream) {
     cache_to_expert.set(test.cache_to_expert);
     last_used.set(test.last_used);
     use_clock.set({ test.use_clock });
-    policy.set(test.policy.empty() ? std::vector<uint8_t>(test.n_tokens, 1) : test.policy);
 
     ggml_cuda_expert_plan plan = {};
     plan.ids_src = ids_src.ptr;
@@ -292,7 +282,6 @@ static void run_case(const test_case & test, hipStream_t stream) {
     plan.fill_expert = fill_expert.ptr;
     plan.fill_slot = fill_slot.ptr;
     plan.cache_ids = cache_ids.ptr;
-    plan.policy = test.policy.empty() ? nullptr : policy.ptr;
     plan.expert_to_cache = expert_to_cache.ptr;
     plan.cache_to_expert = cache_to_expert.ptr;
     plan.last_used = last_used.ptr;
@@ -302,7 +291,6 @@ static void run_case(const test_case & test, hipStream_t stream) {
     plan.n_miss = n_miss.ptr;
     plan.n_fill = n_fill.ptr;
     plan.n_evictions = n_evictions.ptr;
-    plan.n_read_only = n_read_only.ptr;
     plan.n_streamed = n_streamed.ptr;
     plan.n_host_experts = n_host_experts.ptr;
 
@@ -339,7 +327,6 @@ static void run_case(const test_case & test, hipStream_t stream) {
     expect_equal(test.name, "n_miss", n_miss.get(), std::vector<uint32_t>{ expected.n_miss }, 1);
     expect_equal(test.name, "n_fill", n_fill.get(), std::vector<uint32_t>{ expected.n_fill }, 1);
     expect_equal(test.name, "n_evictions", n_evictions.get(), std::vector<uint32_t>{ expected.n_evictions }, 1);
-    expect_equal(test.name, "n_read_only", n_read_only.get(), std::vector<uint32_t>{ expected.n_read_only }, 1);
     expect_equal(test.name, "n_streamed", n_streamed.get(), std::vector<uint32_t>{ expected.n_streamed }, 1);
     expect_equal(test.name, "n_host_experts", n_host_experts.get(), std::vector<uint32_t>{ expected.n_host_experts }, 1);
 
@@ -387,6 +374,7 @@ static void run_backend_source_case(ggml_backend_t backend, ggml_type type, int3
         ggml_backend_cuda_expert_source source_desc = {
             GGML_CUDA_EXPERT_SOURCE_MAGIC,
             static_cast<uint32_t>(n_expert),
+            nullptr,
             &source_weight,
         };
 
@@ -504,10 +492,6 @@ static void run_backend_source_case(ggml_backend_t backend, ggml_type type, int3
     hip_check(hipHostFree(host_data), "hipHostFree");
 }
 
-static size_t align_up(size_t value, size_t alignment) {
-    return (value + alignment - 1) & ~(alignment - 1);
-}
-
 static void run_backend_cached_source_case(ggml_backend_t backend, ggml_type type) {
     const int64_t n_expert      = 8;
     const int64_t n_cache       = 3;
@@ -547,12 +531,6 @@ static void run_backend_cached_source_case(ggml_backend_t backend, ggml_type typ
             0,
             expert_size,
         };
-        ggml_backend_cuda_expert_source source_desc = {
-            GGML_CUDA_EXPERT_SOURCE_MAGIC,
-            static_cast<uint32_t>(n_expert),
-            &source_weight,
-        };
-
         ggml_backend_cuda_expert_cache_desc cache_desc = {};
         cache_desc.magic = GGML_CUDA_EXPERT_CACHE_MAGIC;
         cache_desc.version = GGML_CUDA_EXPERT_CACHE_VERSION;
@@ -561,18 +539,13 @@ static void run_backend_cached_source_case(ggml_backend_t backend, ggml_type typ
         cache_desc.n_weights = 1;
         cache_desc.weights[0] = source_weight;
 
-        size_t state_offset = sizeof(ggml_backend_cuda_expert_cache_state);
-        cache_desc.expert_to_cache_offset = align_up(state_offset, alignof(int32_t));
-        state_offset = cache_desc.expert_to_cache_offset + n_expert*sizeof(int32_t);
-        cache_desc.cache_to_expert_offset = align_up(state_offset, alignof(int32_t));
-        state_offset = cache_desc.cache_to_expert_offset + n_cache*sizeof(int32_t);
-        cache_desc.last_used_offset = align_up(state_offset, alignof(uint64_t));
-        state_offset = cache_desc.last_used_offset + n_cache*sizeof(uint64_t);
-        cache_desc.fill_expert_offset = align_up(state_offset, alignof(int32_t));
-        state_offset = cache_desc.fill_expert_offset + n_cache*sizeof(int32_t);
-        cache_desc.fill_slot_offset = align_up(state_offset, alignof(int32_t));
-        state_offset = cache_desc.fill_slot_offset + n_cache*sizeof(int32_t);
-        cache_desc.state_size = align_up(state_offset, 256);
+        const auto state_layout = ggml_cuda_expert_cache_layout(n_expert, n_cache);
+        cache_desc.expert_to_cache_offset = state_layout.expert_to_cache_offset;
+        cache_desc.cache_to_expert_offset = state_layout.cache_to_expert_offset;
+        cache_desc.last_used_offset = state_layout.last_used_offset;
+        cache_desc.fill_expert_offset = state_layout.fill_expert_offset;
+        cache_desc.fill_slot_offset = state_layout.fill_slot_offset;
+        cache_desc.state_size = state_layout.state_size;
 
         ggml_init_params params = {
             ggml_tensor_overhead()*64 + 2*ggml_graph_overhead_custom(64, false),
@@ -590,10 +563,9 @@ static void run_backend_cached_source_case(ggml_backend_t backend, ggml_type typ
         ggml_tensor * ids   = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_I32, n_expert_used, n_tokens);
         ggml_tensor * state = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_I8, cache_desc.state_size);
 
-        slots->extra = &source_desc;
-
         const int64_t n_routes = n_tokens*n_expert_used;
-        const int64_t route_storage_size = 2*n_routes + n_expert + 1;
+        const auto route_layout = ggml_cuda_expert_cache_route_layout(n_routes, n_expert);
+        const int64_t route_storage_size = route_layout.size/sizeof(int32_t);
         ggml_tensor * cache_args[] = { ids, state, slots };
         ggml_tensor * cache_plan = ggml_custom_4d(
             ctx.get(), GGML_TYPE_I32, route_storage_size, 1, 1, 1,
@@ -602,6 +574,20 @@ static void run_backend_cached_source_case(ggml_backend_t backend, ggml_type typ
             ctx.get(), cache_plan,
             ids->ne[0], ids->ne[1], ids->ne[2], ids->ne[3],
             ids->nb[1], ids->nb[2], ids->nb[3], 0);
+        ggml_backend_moe_cache cache = {};
+        cache.desc = cache_desc;
+        ggml_backend_cuda_expert_source source_desc = {
+            GGML_CUDA_EXPERT_SOURCE_MAGIC,
+            static_cast<uint32_t>(n_expert),
+            &cache,
+            &source_weight,
+        };
+        slots->extra = &source_desc;
+        ggml_backend_cuda_expert_plan_binding plan_binding = {
+            GGML_CUDA_EXPERT_PLAN_MAGIC,
+            &cache,
+        };
+        cache_ids->extra = &plan_binding;
 
         ggml_tensor * source_out = ggml_mul_mat_id(ctx.get(), slots, input, ids);
         source_out->src[3] = cache_ids;
@@ -684,6 +670,78 @@ static void run_backend_cached_source_case(ggml_backend_t backend, ggml_type typ
     hip_check(hipHostFree(host_data), "hipHostFree");
 }
 
+static void run_backend_interface_lifecycle_case(ggml_backend_t backend) {
+    const ggml_backend_dev_t device = ggml_backend_get_device(backend);
+    const ggml_backend_reg_t registry = ggml_backend_dev_backend_reg(device);
+    const auto get_interface = reinterpret_cast<ggml_backend_moe_cache_get_interface_t>(
+        ggml_backend_reg_get_proc_address(registry, "ggml_backend_moe_cache_get_interface"));
+    if (get_interface == nullptr) {
+        throw std::runtime_error("MoE cache interface is unavailable");
+    }
+
+    const ggml_backend_moe_cache_i * api = get_interface();
+    if (api == nullptr || api->version != GGML_BACKEND_MOE_CACHE_INTERFACE_VERSION || !api->supports(device)) {
+        throw std::runtime_error("MoE cache interface is invalid");
+    }
+
+    if (api->get_state_size(8, 0, 1) != 0 || api->get_state_size(8, 8, 1) != 0 ||
+            api->get_state_size(8, 3, 0) != 0) {
+        throw std::runtime_error("MoE cache interface accepted malformed dimensions");
+    }
+
+    ggml_context_ptr source_ctx(ggml_init({ ggml_tensor_overhead(), nullptr, true }));
+    ggml_context_ptr device_ctx(ggml_init({ 4*ggml_tensor_overhead(), nullptr, true }));
+    if (!source_ctx || !device_ctx) {
+        throw std::runtime_error("MoE cache interface context allocation failed");
+    }
+
+    const int64_t source_ne[3] = { 256, 8, 8 };
+    ggml_tensor * source = ggml_new_tensor(source_ctx.get(), GGML_TYPE_Q4_K, 3, source_ne);
+    ggml_backend_buffer_ptr source_buffer(ggml_backend_buft_alloc_buffer(
+        ggml_backend_dev_host_buffer_type(device), ggml_nbytes(source)));
+    if (!source_buffer || ggml_backend_tensor_alloc(
+            source_buffer.get(), source, ggml_backend_buffer_get_base(source_buffer.get())) != GGML_STATUS_SUCCESS) {
+        throw std::runtime_error("MoE cache interface source allocation failed");
+    }
+
+    const int64_t slots_ne[3] = { 256, 8, 3 };
+    ggml_tensor * slots = ggml_new_tensor(device_ctx.get(), GGML_TYPE_Q4_K, 3, slots_ne);
+    ggml_tensor * state = ggml_new_tensor_1d(device_ctx.get(), GGML_TYPE_I8, api->get_state_size(8, 3, 1));
+    ggml_tensor * ids = ggml_new_tensor_2d(device_ctx.get(), GGML_TYPE_I32, 2, 4);
+    ggml_backend_buffer_ptr device_buffer(ggml_backend_alloc_ctx_tensors(device_ctx.get(), backend));
+    if (!device_buffer) {
+        throw std::runtime_error("MoE cache interface device allocation failed");
+    }
+
+    ggml_tensor * sources[] = { source };
+    ggml_tensor * slots_array[] = { slots };
+    if (api->create(backend, nullptr, sources, slots_array, 8, 3, 1) != nullptr ||
+            api->create(backend, state, sources, slots_array, 8, 8, 1) != nullptr) {
+        throw std::runtime_error("MoE cache interface accepted malformed creation");
+    }
+
+    ggml_backend_moe_cache_t cache = api->create(backend, state, sources, slots_array, 8, 3, 1);
+    if (cache == nullptr || slots->extra == nullptr) {
+        throw std::runtime_error("MoE cache interface creation failed");
+    }
+
+    ggml_context_ptr graph_ctx(ggml_init({ 8*ggml_tensor_overhead(), nullptr, true }));
+    const ggml_backend_moe_cache_plan plan = api->build_plan(cache, graph_ctx.get(), ids);
+    if (plan.selectors == nullptr || plan.execution == nullptr ||
+            ggml_nelements(plan.selectors) != ggml_nelements(ids) ||
+            ggml_nelements(plan.execution) != 2*ggml_nelements(ids) + 9) {
+        api->destroy(cache);
+        throw std::runtime_error("MoE cache interface plan shape mismatch");
+    }
+
+    api->destroy(cache);
+    if (slots->extra != nullptr) {
+        throw std::runtime_error("MoE cache interface left a slot binding after destroy");
+    }
+
+    std::printf("backend-interface-lifecycle: OK\n");
+}
+
 static std::vector<int32_t> identity_experts(int32_t n_expert) {
     std::vector<int32_t> result(n_expert);
     for (int32_t i = 0; i < n_expert; ++i) {
@@ -701,6 +759,7 @@ int main() {
 
     hipStream_t stream = nullptr;
     try {
+        run_backend_interface_lifecycle_case(backend);
         hip_check(hipStreamCreate(&stream), "hipStreamCreate");
 
         run_case({
@@ -713,7 +772,6 @@ int main() {
             std::vector<int32_t>(8, -1),
             std::vector<uint64_t>(8, 0),
             0,
-            {},
         }, stream);
 
         run_case({
@@ -726,7 +784,6 @@ int main() {
             { 0, 8, 10, 12, 14, 15, 6, 7 },
             { 20, 10, 1, 2, 3, 4, 5, 6 },
             20,
-            {},
         }, stream);
 
         run_case({
@@ -739,7 +796,6 @@ int main() {
             identity_experts(16),
             std::vector<uint64_t>(16, 4),
             4,
-            {},
         }, stream);
 
         std::vector<int32_t> duplicate_ids;
@@ -756,7 +812,6 @@ int main() {
             std::vector<int32_t>(8, -1),
             std::vector<uint64_t>(8, 0),
             0,
-            {},
         }, stream);
 
         run_case({
@@ -769,33 +824,6 @@ int main() {
             std::vector<int32_t>(256, -1),
             std::vector<uint64_t>(256, 0),
             0,
-            {},
-        }, stream);
-
-        run_case({
-            "read-only",
-            8,
-            2,
-            2,
-            2,
-            { 0, 3, 1, 4 },
-            { 0, 1 },
-            { 10, 20 },
-            20,
-            { 0, 0 },
-        }, stream);
-
-        run_case({
-            "mixed-policy",
-            8,
-            2,
-            3,
-            2,
-            { 0, 2, 3, 1, 3, 0 },
-            { 0, 1 },
-            { 10, 20 },
-            20,
-            { 0, 1, 0 },
         }, stream);
 
         run_case({
@@ -808,20 +836,6 @@ int main() {
             { -1, -1 },
             { 0, 0 },
             0,
-            { 1, 1 },
-        }, stream);
-
-        run_case({
-            "null-policy-overflow",
-            8,
-            2,
-            2,
-            2,
-            { 0, 1, 2, 3 },
-            { -1, -1 },
-            { 0, 0 },
-            0,
-            {},
         }, stream);
 
         for (ggml_type type : { GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K }) {

@@ -18,69 +18,6 @@ extern "C" {
 #define GGML_CUBLAS_NAME "cuBLAS"
 #endif
 #define GGML_CUDA_MAX_DEVICES       16
-#define GGML_CUDA_EXPERT_CACHE_MAX_WEIGHTS 4
-#define GGML_CUDA_EXPERT_CACHE_MAGIC 0x4558504341434845ULL
-#define GGML_CUDA_EXPERT_CACHE_VERSION 6
-#define GGML_CUDA_EXPERT_SOURCE_MAGIC 0x4558505352430001ULL
-
-struct ggml_backend_cuda_expert_cache_stats {
-    uint64_t resolve_calls;
-    uint64_t update_touches;
-    uint64_t read_only_touches;
-    uint64_t resident_routes;
-    uint64_t streamed_routes;
-    uint64_t cache_hits;
-    uint64_t cache_misses;
-    uint64_t evictions;
-    uint64_t h2d_bytes;
-    uint64_t host_expert_bytes;
-    uint64_t fill_ticks;
-};
-
-struct ggml_backend_cuda_expert_cache_state {
-    uint64_t use_clock;
-    struct ggml_backend_cuda_expert_cache_stats stats;
-    uint64_t fill_start_ticks;
-    uint32_t n_active;
-    uint32_t n_resident;
-    uint32_t n_misses;
-    uint32_t n_fills;
-    uint32_t n_evictions;
-    uint32_t n_read_only;
-    uint32_t n_streamed;
-    uint32_t n_host_experts;
-    uint32_t copy_blocks_done;
-};
-
-struct ggml_backend_cuda_expert_cache_weight {
-    const void * host_data;
-    void * device_data;
-    uint64_t host_offset;
-    uint64_t expert_size;
-};
-
-struct ggml_backend_cuda_expert_source {
-    uint64_t magic;
-    uint32_t n_expert;
-    const struct ggml_backend_cuda_expert_cache_weight * weight;
-};
-
-struct ggml_backend_cuda_expert_cache_desc {
-    uint64_t magic;
-    uint32_t version;
-    uint32_t n_expert;
-    uint32_t n_cache;
-    uint32_t n_weights;
-    uint64_t expert_to_cache_offset;
-    uint64_t cache_to_expert_offset;
-    uint64_t last_used_offset;
-    uint64_t fill_expert_offset;
-    uint64_t fill_slot_offset;
-    uint64_t state_size;
-    uint64_t wall_clock_hz;
-    struct ggml_backend_cuda_expert_cache_weight weights[GGML_CUDA_EXPERT_CACHE_MAX_WEIGHTS];
-};
-
 // backend API
 GGML_BACKEND_API ggml_backend_t ggml_backend_cuda_init(int device);
 

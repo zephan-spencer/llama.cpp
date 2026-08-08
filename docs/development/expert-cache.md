@@ -1,118 +1,77 @@
-# Host-backed MoE expert cache specification
+# MoE expert cache specification
 
-## Requirement language
+## Purpose
 
-`MUST`, `REQUIRED`, `SHALL`, `SHOULD`, and `MAY` define requirement levels.
+The MoE expert cache keeps selected routed expert weight slices in GPU memory while complete routed weights remain in mapped host memory. Each routed layer owns an independent cache with a common capacity. The feature serves models whose complete expert weights exceed available GPU memory.
 
-## Scope
+`--moe-cache-experts N` selects capacity `N`. Zero selects ordinary MoE execution. A positive value requires `n_expert_used <= N < n_expert`.
 
-Version 1 has this target matrix:
+## Supported configuration
 
-| Property | Required value |
+| Property | Current value |
 | --- | --- |
-| process count | 1 |
-| tensor parallelism | 1 |
-| expert parallelism | 1 |
-| accelerator count | 1 |
-| accelerator | AMD Radeon AI PRO R9700 |
-| backend | HIP |
-| reference model | `unsloth/Qwen3.6-35B-A3B-MTP-GGUF` Q4_K_XL |
-| expert weight types | Q4_K, Q5_K, Q6_K |
-| projection layouts | gate and up, merged gate-up, down |
+| backend | ROCm/HIP |
+| accelerator count | one |
+| model placement | every model layer on the accelerator |
+| split mode | none or single-device layer split |
+| routed weight location | accelerator-visible host buffer |
+| tested weight types | Q4_K, Q5_K, Q6_K |
 | matrix paths | MMQ and MMV |
+| projection layouts | gate and up, merged gate-up, down |
 
-Version 1 excludes tensor-parallel coordination, expert parallelism, DeepSeek-specific execution, and model-specific fused FFNs.
+Cache initialization rejects CPU layer placement, multiple accelerator devices, tensor splitting, meta devices, unsupported backends, incomplete routed tensors, tensor buffer overrides for routed weights, invalid capacities, and models without routed experts.
 
-## Terms
+CUDA, Vulkan, and meta backends expose cache support after implementing the backend interface. A meta implementation owns rank-local child handles and coordinates route plans after tensor-parallel execution semantics are defined.
 
-| Term | Definition |
-| --- | --- |
-| logical expert | Expert selected by the model router. Its ID has range `[0, n_expert)`. |
-| cache slot | Persistent GPU storage for one logical expert slice from every cached projection in one layer. |
-| resident expert | Logical expert with a valid cache slot. |
-| streamed expert | Logical expert executed from its mapped host tensor slice. |
-| route | One `(token, expert-rank)` router selection. |
-| update route | Route with permission to update cache policy state. |
-| read-only route | Route with permission to inspect residency only. |
-| policy state | `expert_to_slot`, `slot_to_expert`, `last_used`, and `use_clock`. |
-| source selector | Execution metadata selecting a cache slot or the host-source sentinel. |
-| plan | One layer's policy update and route classification for one physical ubatch. |
-| saved route plan | The grouped route order and expert boundaries published by the cache plan for reuse by all projections in that layer. |
+## Ownership
 
-## User interface
+`llama_moe_expert_cache` owns feature configuration, per-layer source tensors, cache-slot tensors, state tensors, device buffers, backend handles, synchronization, memory accounting, and aggregate statistics.
 
-`--moe-cache-experts N` controls persistent cache capacity per routed MoE layer.
+One backend handle owns one layer cache. The handle owns cache-state layout, source bindings, slot bindings, selector encoding, route-plan layout, replacement state, transfer scheduling, and backend statistics. Slot and plan bindings remain valid through handle destruction. Handle destruction clears every slot binding before releasing storage.
 
-| Value | Behavior |
-| --- | --- |
-| omitted | Normal model placement |
-| `0` | Normal model placement |
-| `n_expert_used <= N < n_expert` | Host-backed routed experts with `N` GPU cache slots per routed layer |
+Source tensors and backend handles have context lifetime. Graph plan tensors have graph lifetime. Cache state and slot storage have context lifetime.
 
-All other positive values are invalid.
+## Backend interface
 
-Cache mode requires:
+The backend registry exposes `ggml_backend_moe_cache_i` under `ggml_backend_moe_cache_get_interface`. ROCm supplies interface version 1.
 
-- every model layer assigned to one HIP device;
-- split mode `none` or single-device `layer` mode;
-- device-visible host backing for every routed expert weight tensor;
-- complete GPU offload of model layers.
+`supports(device)` reports device capability. `get_state_size(n_expert, n_cache, n_weights)` returns required state bytes or zero for an invalid configuration.
 
-Cache mode rejects:
+`create` receives one backend, one allocated state tensor, ordered source and slot arrays, expert count, capacity, and projection count. Creation validates buffer ownership, host visibility, tensor types, expert dimensions, slot dimensions, and expert strides. Failure returns a null handle and leaves tensor bindings unchanged.
 
-- tensor split mode;
-- CPU MoE placement options;
-- routed expert tensor overrides;
-- `--no-host`;
-- a model with zero routed experts;
-- a model with incompatible routed expert dimensions.
+`build_plan(handle, context, logical_ids)` returns:
 
-Normal placement with the option omitted defines the all-resident performance ceiling and the exclusive full-residency configuration.
+- `selectors`: integer source selectors consumed by cached `MUL_MAT_ID` operations.
+- `execution`: the graph operation that resolves routes, updates state, fills slots, and owns saved route storage.
 
-## Weight placement
+The selector tensor carries a backend-private association with its handle. Matrix kernels use that association to obtain saved grouped routes. llama graph code treats both returned tensors as opaque backend products.
 
-Positive cache capacity assigns these tensors to device-visible host backing:
+`get_stats` reads one handle. `reset_stats` clears one handle. The llama owner aggregates every layer.
 
-- routed gate weights;
-- routed up weights;
-- routed merged gate-up weights;
-- routed down weights.
+## Tensor contract
 
-Dense weights, shared experts, routers, bias tensors, scale tensors, embeddings, attention weights, and output weights use normal placement rules.
-
-The loader MUST produce model-lifetime host addresses visible to the target HIP device. Valid implementations include a HIP host buffer or a model-load copy into persistent pinned backing. Global mmap selection MAY supply file data to the load operation; forward execution MUST use the persistent device-visible backing.
-
-Each expert slice occupies `tensor->nb[2]` bytes. Source tensors MUST have contiguous expert slices and `ne[3] = 1`. A slot tensor preserves the source tensor's type, `ne[0]`, `ne[1]`, `nb[0]`, and `nb[1]`, with `ne[2] = N` and `ne[3] = 1`.
-
-## Token policy API
-
-`llama_batch` exposes an optional policy array with one entry per batch token. `llama_ubatch` carries the matching entries for its tokens.
-
-The policy values are:
+Logical IDs use type I32 and shape `[n_expert_used, n_tokens]`. Flattened route order is token-major:
 
 ```text
-LLAMA_MOE_CACHE_POLICY_READ_ONLY
-LLAMA_MOE_CACHE_POLICY_UPDATE
+route = token * n_expert_used + expert_rank
 ```
 
-A null policy pointer means `UPDATE` for every token. A non-null policy pointer supplies one policy value per token. Batch allocation, slicing, sequence reordering, embedding input, token input, graph reuse, and logical-to-physical ubatch conversion MUST preserve policy-to-token association.
+A routed source tensor has one expert slice along dimension two and `ne[3] = 1`. Each expert occupies `nb[2]` bytes. Its buffer type equals the target device host buffer type.
 
-Callers that provide a policy array use `READ_ONLY` for routes that must preserve policy state and `UPDATE` for routes eligible to admit or evict experts.
+A slot tensor preserves source type, `ne[0]`, `ne[1]`, `nb[0]`, `nb[1]`, and `nb[2]`. It uses `ne[2] = N` and `ne[3] = 1`. Every projection in one layer uses the same expert-to-slot mapping.
 
-## Layer ownership and lifetime
+Selectors have the logical-ID shape and route order:
 
-Each routed layer owns:
+```text
+selector >= 0 : persistent cache slot
+selector < 0  : host expert encoded as -logical_expert_id - 1
+```
 
-- mapped host tensors;
-- persistent GPU cache tensors;
-- policy state;
-- planner workspace;
-- backend source-view descriptors;
-- cumulative device counters.
+Logical expert IDs remain graph inputs for bias, scale, LoRA, route weighting, graph callbacks, and graph inspection.
 
-These objects have model or context lifetime. Context destruction releases them after backend completion.
+## State invariants
 
-Policy state uses:
+Each layer state contains:
 
 ```text
 expert_to_slot[n_expert] : int32
@@ -121,417 +80,72 @@ last_used[N]             : uint64
 use_clock                : uint64
 ```
 
-Initialization sets every mapping entry to `-1`, every recency value to `0`, and `use_clock` to `0`.
+Initialization sets mapping entries to `-1`, recency values to zero, and `use_clock` to zero.
 
-For every resident pair `(expert, slot)`:
+For each resident pair `(expert, slot)`:
 
 ```text
 expert_to_slot[expert] = slot
 slot_to_expert[slot] = expert
 ```
 
-Every other expert and slot has mapping value `-1`.
+Every resident mapping has an exact inverse. Each slot contains slices for the same logical expert across every cached projection.
 
-## Route order
+## Admission and overflow
 
-Flattened route index uses token-major order:
+The planner visits logical routes in input order and records each expert once. This first-occurrence order controls admission.
 
-```text
-route_index = token_index * n_expert_used + expert_rank
-```
+Requested resident experts retain their slots and protect those slots for the complete plan. Missing experts select slots in this order:
 
-Unique expert order uses the first flattened occurrence of each logical expert. This order governs admission and overflow selection.
+1. Lowest-index empty slot.
+2. Unprotected slot with the lowest `last_used` value.
+3. Lowest slot index among equal timestamps.
 
-## Planner inputs and outputs
+Each admitted expert protects its selected slot. Replacement updates both mapping arrays. A plan containing requested experts increments `use_clock` once and assigns the new timestamp to every requested resident expert.
 
-One layer plan consumes:
+When protected slots consume the capacity, remaining missing experts receive host selectors. Overflow preserves route count, route order, and route multiplicity. Every route executes once.
 
-- logical route IDs with shape `[n_expert_used, n_tokens]`;
-- token policy with shape `[n_tokens]`, or implicit `UPDATE` when the policy pointer is null;
-- current policy state;
-- `n_expert` and `N`.
+## Saved route plan
 
-One layer plan emits:
+One physical ubatch creates one plan per cached layer. The execution tensor stores source selectors, route indices grouped by logical expert, and one start/end boundary range per expert.
 
-- one compact expert-major route order;
-- one start/end boundary pair for every expert;
-- source selectors with the same logical shape as route IDs;
-- fill expert IDs;
-- fill slot IDs;
-- updated policy state;
-- counter deltas.
+Gate, up, merged gate-up, and down projections consume the same saved grouping. A projection may derive its activation index with one linear pass over saved route indices. Rebuilding expert grouping inside a projection violates the interface contract.
 
-The compact route order, expert boundaries, and source selectors MUST be
-stored in graph-managed GPU memory. Gate, up, merged gate-up, and down
-projections in the layer MUST reuse this saved route plan. A projection MAY
-derive its own activation/input index from the saved route order, but it MUST
-do so with one linear pass and MUST NOT regroup the logical routes.
-
-Source selector values use:
+The scheduler establishes this order:
 
 ```text
-selector >= 0 : persistent cache slot
-selector < 0  : mapped host source, encoded as -logical_expert_id - 1
+logical route IDs
+    -> cache plan and slot fills
+    -> cached gate/up or gate-up MUL_MAT_ID
+    -> activation
+    -> cached down MUL_MAT_ID
+    -> route weighting and reduction
 ```
 
-## Deterministic planning algorithm
+Every fill completes before a consumer reads its slot. Every earlier slot consumer completes before replacement writes that slot.
 
-The planner MUST execute these phases in order.
+## Forward-path constraints
 
-### 1. Collect update experts
+Cache planning, admission, eviction, classification, and saved-route construction execute on the accelerator. The forward path prohibits route transfers to the CPU, CPU replacement decisions, source-selection synchronization, expert-weight allocation, host mapping changes, temporary tensors containing the complete expert set, and replacement of graph-visible logical IDs.
 
-Build `update_experts` from routes whose token policy is `UPDATE`. Deduplicate by logical expert ID and preserve first-route occurrence order.
-
-### 2. Protect update hits
-
-For each expert in `update_experts`, inspect the entry-state map present at plan start.
-
-- A resident expert increments `hits` and protects its slot.
-- An absent expert increments `misses`.
-
-Protection lasts through the complete plan.
-
-### 3. Admit update misses
-
-Process absent update experts in `update_experts` order.
-
-Slot selection uses:
-
-1. the lowest-index empty slot;
-2. the unprotected slot with the lowest `last_used` value;
-3. the lowest slot index for equal `last_used` values;
-4. host-source overflow when the eligible-slot set is empty.
-
-Each admitted expert protects its selected slot. Replacing a resident expert increments `evictions`. A completed admission increments `fills`.
-
-### 4. Update recency
-
-A plan containing at least one update expert increments `use_clock` once. Every update expert resident after phase 3 receives the new clock value in its slot.
-
-A plan containing zero update experts preserves the complete policy state byte-for-byte.
-
-### 5. Classify routes
-
-Classify every route from the policy state produced by phase 4.
-
-- A resident logical expert receives its cache slot selector.
-- An absent logical expert receives the host-source sentinel.
-
-Route classification preserves route count and route order. Duplicate logical experts produce duplicate execution routes.
-
-### 6. Publish fills
-
-Each fill copies every cached projection slice for the selected logical expert. Backend dependencies gate every consumer of the selected slot on fill completion.
-
-Residency used by execution requires both a valid mapping and completed fill dependency.
-
-## Overflow semantics
-
-An update working set MAY exceed cache capacity. Protected update hits retain their slots. Admissions consume eligible slots in deterministic order. Remaining update experts use host-source selectors.
-
-A read-only route for an expert admitted during the same plan receives the new cache slot selector. A read-only route for an overflow expert receives the host-source sentinel.
-
-Each input route produces one execution route. Overflow changes source selection only.
-
-## Source-aware `mul_mat_id`
-
-Logical route IDs retain model meaning. Source selectors carry physical execution placement.
-
-HIP MMQ and MMV weight address selection uses:
-
-```text
-selector >= 0:
-    cache_base + selector * cache_tensor.nb[2]
-
-selector < 0:
-    host_base + (-selector - 1) * host_tensor.nb[2]
-```
-
-The source view supplies:
-
-- logical host tensor metadata and device-visible base address;
-- persistent cache tensor metadata and device base address;
-- per-route source selectors;
-- logical route IDs.
-
-Gate, up, merged gate-up, and down projections use the same source-selection contract.
-
-Graph semantics retain logical IDs for:
-
-- routing weights;
-- expert bias;
-- expert scale;
-- LoRA selection;
-- tensor naming;
-- graph callbacks;
-- graph inspection.
-
-The existing MoE graph defines activation, activation clamping, route-weight placement, projection order, expert bias, expert scale, LoRA, and reduction.
-
-## Execution ordering
-
-The backend scheduler MUST establish this dependency order:
-
-```text
-router output
-    -> policy plan
-    -> route grouping and cache fills
-    -> source-aware gate/up or gate-up mul_mat_id
-    -> graph activation operations
-    -> source-aware down mul_mat_id
-    -> graph route weighting and reduction
-```
-
-For one physical ubatch and cached layer, route grouping occurs exactly once,
-inside the cache-planning operation, before cache fills and matrix operations.
-Operations outside the expert-cache path retain their existing route
-calculation.
-
-Cache-slot reuse MUST wait for completion of every earlier operation reading that slot. Host mappings MUST exist before graph construction and persist through graph completion.
-
-## Prohibited forward operations
-
-The forward path prohibits:
-
-- route-ID device-to-host transfer;
-- policy device-to-host transfer;
-- CPU admission, eviction, recency, or classification decisions;
-- device synchronization for policy or source selection;
-- expert-weight allocation;
-- host mapping creation or destruction;
-- concatenation of resident and host experts into a temporary weight tensor;
-- logical-ID replacement in graph-visible tensors;
-- model-specific FFN execution branches.
-
-Backend graph workspace MAY contain activations, quantized activation tiles, route compaction, and operation scratch.
+Mapped host addresses remain stable through graph completion. Graph execution performs host-source reads directly for streamed experts.
 
 ## Failure behavior
 
-Initialization MUST fail before the first forward for:
+Positive cache capacity requires a matching backend interface. Context construction fails before the first forward for unsupported topology, unsupported backend, incompatible routed tensors, unavailable accelerator-visible host backing, cache allocation failure, and backend handle creation failure.
 
-- unavailable device-visible host backing;
-- unsupported HIP weight type;
-- incompatible expert dimensions;
-- cache allocation failure;
-- invalid capacity;
-- unsupported device topology.
-
-Planner overflow MUST complete through host-source execution.
-
-A synchronous CPU resolver MAY support non-target backends as a fallback. HIP completion evidence excludes fallback execution.
-
-## Invariants
-
-For every layer and forward:
-
-1. Every route has one logical expert ID and one source selector.
-2. Every route executes exactly once.
-3. Every cache selector resolves to the routed logical expert at execution time.
-4. Every host selector resolves through the routed logical expert ID.
-5. Read-only-only input preserves policy state byte-for-byte.
-6. Update effects complete before route classification.
-7. Duplicate routes preserve multiplicity and create one update touch per unique update expert.
-8. Overflow preserves protected update hits.
-9. Mapping tables are exact inverses for resident entries.
-10. Cache capacity is smaller than routed expert count.
-11. Fill completion precedes slot consumption.
-12. Prior slot consumption precedes slot replacement.
+Backend plan construction failure stops graph construction. A cache request with a failed requirement produces an initialization error.
 
 ## Counters
 
-Counters are cumulative across all cached layers in one context. Context performance reset sets every counter to zero. Layer-local counters are valid storage; printed context values equal the sum of stored layer values.
+`resolve_calls` counts plans. `update_touches` counts unique requested experts. `resident_routes` and `streamed_routes` count routes by selector class. `cache_hits`, `cache_misses`, and `evictions` count unique experts. `h2d_bytes` counts bytes copied into slots. `host_expert_bytes` counts unique streamed expert slices across cached projections. `fill_ticks` uses each handle's `wall_clock_hz`; aggregate display converts each handle to milliseconds before summation.
 
-| Counter | Unit | Definition |
-| --- | --- | --- |
-| `update_touches` | unique experts | Unique update experts processed by policy |
-| `read_only_touches` | routes | Read-only routes classified |
-| `resident_routes` | routes | Routes assigned a persistent cache slot |
-| `streamed_routes` | routes | Routes assigned the host-source sentinel |
-| `host_expert_bytes` | bytes | Sum of unique streamed expert slices presented to each projection operation |
-| `fills` | experts | Successful admissions |
-| `hits` | unique experts | Update experts resident at plan start |
-| `misses` | unique experts | Update experts absent at plan start |
-| `evictions` | experts | Resident experts displaced by admissions |
+Context performance reset clears every layer counter. Printed context values equal the sum of layer values.
 
-For `host_expert_bytes`, uniqueness uses `(layer, operation, logical_expert)` within one forward. The slice size is the source tensor's `nb[2]`. Hardware traffic counters and profiler measurements use separate names.
+## Acceptance
 
-Required identities for every reporting interval:
+ROCm acceptance covers Q4_K, Q5_K, and Q6_K through MMQ and MMV. Each type exercises resident routes, streamed routes, repeated plans, duplicate routes, complete expert activation, and overflow. Cached matrix results use fully resident routed matrices as the numerical reference.
 
-```text
-hits + misses = update_touches
-resident_routes + streamed_routes = total_routes
-fills <= misses
-```
+Interface tests obtain version 1 from the backend registry, reject invalid dimensions and malformed creation, construct a handle with backend-owned buffers, build selector and execution tensors, destroy the handle, and verify slot-binding cleanup.
 
-Counter retrieval MAY synchronize during an explicit statistics request. Execution scheduling excludes synchronization performed solely for reporting.
-
-## Planner validation
-
-GPU tests MUST cover:
-
-| Case | Required assertion |
-| --- | --- |
-| read-only resident | cache selector; byte-identical policy state |
-| read-only absent | host selector; byte-identical policy state |
-| mixed policies | update phases precede classification |
-| same-plan visibility | read-only route observes update admission |
-| overflow | every route classified; excess update experts streamed |
-| duplicate update routes | one update touch; full route multiplicity |
-| duplicate read-only routes | one classification per route; zero policy mutation |
-| empty slots | lowest empty slot selected |
-| LRU replacement | lowest recency selected |
-| recency tie | lowest slot index selected |
-| protected hit | selected slot survives same-plan admissions |
-| repeated plan | deterministic state and outputs |
-
-The read-only preservation test compares the entire policy-state byte range before and after execution. Counter storage lies outside that byte range.
-
-## Source-aware operation validation
-
-Backend tests MUST compare source-aware `mul_mat_id` output with the normal logical-expert operation for:
-
-| Dimension | Required cases |
-| --- | --- |
-| source distribution | all resident, all host, mixed |
-| temporal behavior | stable residency, eviction between forwards, slot reuse |
-| projection layout | separate gate/up, merged gate-up, down |
-| weight type | Q4_K, Q5_K, Q6_K |
-| dispatch | MMQ, MMV |
-| route pattern | unique experts, duplicates, shared slot across consecutive forwards |
-
-Comparisons use established backend tolerances. A slot-reuse case MUST detect execution with the previous logical expert's weights.
-
-## End-to-end validation
-
-The reference comparison uses normal all-resident placement with `--moe-cache-experts` omitted.
-
-Required workloads:
-
-1. pure prefill;
-2. decode after cache warmup;
-3. mixed server traffic containing prompt and decode tokens;
-4. update working-set overflow;
-5. all-read-only execution after cache warmup.
-
-Every comparison records:
-
-- prompt bytes and token IDs;
-- random seed;
-- sampler settings;
-- context, batch, and ubatch sizes;
-- cache capacity;
-- generated token IDs;
-- maximum absolute logit error;
-- maximum relative logit error;
-- tolerance;
-- cache counters before and after the workload.
-
-Deterministic decoding requires exact generated token equality. Logit comparison requires declared absolute and relative tolerances before measurement.
-
-Mixed server validation MUST capture one physical ubatch containing at least one `READ_ONLY` token and at least one `UPDATE` token.
-
-## Performance validation
-
-### Fixed environment
-
-| Property | Value |
-| --- | --- |
-| physical device | GPU 1 |
-| process selector | `HIP_VISIBLE_DEVICES=1` |
-| backend device | `ROCm0` |
-| model | `unsloth/Qwen3.6-35B-A3B-MTP-GGUF` Q4_K_XL |
-| tensor parallelism | 1 |
-| ubatch size | 128 |
-| prompt lengths | 512, 2048 |
-| cache capacities | 32, 64, 128, 192 |
-| measured repetitions | 5 |
-
-### Baselines
-
-| Name | Definition |
-| --- | --- |
-| decode regression baseline | clean `cd034f6fa` build with matching options |
-| prefill control | candidate build with source-aware cache execution disabled and matching options |
-| candidate | source-aware implementation under evaluation |
-| all-resident ceiling | candidate build with cache option omitted |
-
-Commands, model file, device selection, batch values, context values, warmup, and repetition count MUST match across comparable runs.
-
-### Evidence
-
-Each run stores:
-
-- exact command and environment;
-- commit and worktree identity;
-- build configuration;
-- compiler, HIP, and driver versions;
-- raw stdout and stderr;
-- per-repetition throughput;
-- expert-cache counters;
-- `amd-smi` inventory;
-- timestamped utilization, VRAM, power, and PCIe telemetry.
-
-Medians use all five measured repetitions. Reports include every tested capacity.
-
-Evidence resides under:
-
-```text
-.git/expert-cache-prefill-results/
-```
-
-An index maps each reported value to raw command output and telemetry files.
-
-### Acceptance gates
-
-One tested capacity MUST satisfy all gates:
-
-1. maximum absolute and relative logit errors satisfy the declared tolerances;
-2. deterministic generated tokens match the all-resident comparison;
-3. median prompt throughput improvement is at least 10 percent over the prefill control at 512 tokens;
-4. median prompt throughput improvement is at least 10 percent over the prefill control at 2048 tokens;
-5. median cached decode throughput is at least 95 percent of the decode regression baseline.
-
-Prompt improvement uses:
-
-```text
-(candidate_median / baseline_median - 1) * 100
-```
-
-## Route-trace evidence
-
-Route tracing is diagnostic. Valid uses include route-distribution analysis, working-set measurement, and capacity selection.
-
-Primary performance evidence requires the real scheduler boundary and a trace captured with the measured ubatch size. Rechunked traces are labeled `counterfactual_rechunk`.
-
-Policy simulation, synchronized tensor callbacks, and counterfactual boundaries are excluded from production correctness and throughput evidence.
-
-## Future tensor-parallel contract
-
-Each rank owns one policy state and one source view per layer. A logical cache entry maps to one rank-local expert shard on every rank.
-
-Future tensor-parallel execution requires:
-
-- identical logical residency maps across ranks;
-- rank-local fills for each admitted logical expert;
-- publication after completion of every required rank-local fill;
-- coordinated invalidation on eviction;
-- rank-local transfer and wait counters.
-
-Version 1 data structures SHOULD preserve this ownership boundary.
-
-## Conformance
-
-A conforming implementation MUST satisfy every requirement in this specification, including:
-
-- token-policy propagation from `llama_batch` through every `llama_ubatch`;
-- mixed policy values in a captured server ubatch;
-- GPU planning with the specified ordering and overflow behavior;
-- byte-identical policy state across all-read-only execution;
-- route-level cache or host source selection in HIP MMQ and MMV;
-- source-aware gate, up, merged gate-up, and down projections;
-- Q4_K, Q5_K, and Q6_K backend coverage;
-- pure prefill, decode, mixed, overflow, and warm read-only model validation;
-- counters with the specified definitions and identities;
-- one capacity satisfying every acceptance gate;
-- recorded all-resident ceilings and telemetry;
-- production execution with zero model-specific full-FFN cache branches.
+A configured HIP build includes server, benchmark, batched benchmark, and perplexity targets. `test-moe-expert-plan` and `test-batch-alloc` complete successfully.

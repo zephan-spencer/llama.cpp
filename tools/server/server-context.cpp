@@ -152,7 +152,6 @@ struct server_batch {
             batch.n_seq_id + off,
             batch.seq_id   + off,
             batch.logits   + off,
-            batch.moe_cache_policy ? batch.moe_cache_policy + off : nullptr,
         };
 
         return view;
