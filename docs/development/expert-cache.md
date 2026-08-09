@@ -113,7 +113,7 @@ An active output-priority expert already resident retains its slot and assigns t
 2. Slot outside the current epoch whose resident expert has no route in the physical plan, with the lowest `last_used` value.
 3. Lowest slot index among equal timestamps.
 
-A prompt expert already resident after output-priority admission retains its slot. A missing prompt expert selects an empty slot, then the least-recently-used slot outside the current epoch whose resident expert has no route in the plan.
+A prompt expert already resident after output-priority admission retains its slot. A missing prompt expert selects the lowest-index empty slot. Missing prompt experts use the mapped host source after the cache reaches capacity. Prompt admission preserves every occupied slot.
 
 Every expert requested by a physical ubatch retains its slot through that ubatch. A missing active output-priority expert streams from mapped host memory when active routes and current-epoch protection exhaust eviction candidates. The planner records that expert as pending for the current epoch. Each later physical ubatch processes active output-priority routes, same-epoch pending output-priority experts in ascending logical-expert order, then active prompt routes. Pending admission requires an inactive, epoch-unprotected victim. Admission clears the pending entry, protects the new slot for the current epoch, and updates recency. Epoch rollover clears earlier pending entries.
 

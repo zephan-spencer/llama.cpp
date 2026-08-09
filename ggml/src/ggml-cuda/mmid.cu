@@ -236,7 +236,7 @@ static __global__ void expert_plan_cache(
                 }
             }
 
-            if (victim < 0) {
+            if (victim < 0 && !prompt_pass) {
                 uint64_t oldest = UINT64_MAX;
                 for (int32_t slot = 0; slot < n_cache; ++slot) {
                     const int32_t resident = plan.cache_to_expert[slot];

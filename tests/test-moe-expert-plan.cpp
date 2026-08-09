@@ -176,7 +176,7 @@ static plan_result make_reference(const test_case & test) {
                     break;
                 }
             }
-            if (victim < 0) {
+            if (victim < 0 && pass == 0) {
                 uint64_t oldest = UINT64_MAX;
                 for (int32_t slot = 0; slot < test.n_cache; ++slot) {
                     const int32_t resident = result.cache_to_expert[slot];
@@ -1032,7 +1032,7 @@ int main() {
             1,
             1,
             { 2 },
-            { 0 },
+            { 1 },
             { 0, 1 },
             { 0, 1 },
             1,
@@ -1047,7 +1047,7 @@ int main() {
             1,
             1,
             { 2 },
-            { 0 },
+            { 1 },
             { 0, 1 },
             { 0, 1 },
             1,
@@ -1062,7 +1062,7 @@ int main() {
             2,
             1,
             { 0, 2 },
-            { 0, 0 },
+            { 1, 1 },
             { 0, 1 },
             { 1, 9 },
             9,
@@ -1077,10 +1077,25 @@ int main() {
             1,
             1,
             { 2 },
-            { 0 },
+            { 1 },
             { 0, 1 },
             { 5, 5 },
             5,
+            {},
+            13,
+        }, stream);
+
+        run_case({
+            "prompt-residency-stability",
+            4,
+            2,
+            1,
+            1,
+            { 2 },
+            { 0 },
+            { 0, 1 },
+            { 3, 7 },
+            7,
             {},
             13,
         }, stream);
