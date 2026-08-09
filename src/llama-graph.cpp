@@ -230,6 +230,20 @@ bool llm_graph_input_out_ids::can_reuse(const llm_graph_params & params) {
     return res;
 }
 
+void llm_graph_input_moe_cache::set_input(const llama_ubatch * ubatch) {
+    GGML_ASSERT(ubatch->output_priority != nullptr);
+    GGML_ASSERT(cache != nullptr);
+
+    ggml_backend_tensor_set(priority, ubatch->output_priority, 0,
+        ubatch->n_tokens*ggml_element_size(priority));
+    const int32_t value = static_cast<int32_t>(cache->epoch());
+    ggml_backend_tensor_set(epoch, &value, 0, sizeof(value));
+}
+
+bool llm_graph_input_moe_cache::can_reuse(const llm_graph_params & params) {
+    return priority != nullptr && priority->ne[0] == params.ubatch.n_tokens;
+}
+
 void llm_graph_input_mean::set_input(const llama_ubatch * ubatch) {
     if (cparams.embeddings   &&
        (cparams.pooling_type == LLAMA_POOLING_TYPE_MEAN ||
@@ -1978,8 +1992,9 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         /*.ids     =*/ selected_experts,
     };
     if (moe_cache != nullptr) {
+        const auto [token_priority, epoch] = build_inp_moe_cache();
         cache_binding = moe_cache->bind(
-            ctx0, sched, il, selected_experts,
+            ctx0, sched, il, selected_experts, token_priority, epoch,
             up_exps, gate_exps, down_exps, gate_up_exps);
         cb(cache_binding.ids, "ffn_moe_cache_ids", il);
     }
@@ -2306,6 +2321,24 @@ ggml_tensor * llm_graph_context::build_inp_out_ids() const {
     res->add_input(std::move(inp));
 
     return cur;
+}
+
+std::pair<ggml_tensor *, ggml_tensor *> llm_graph_context::build_inp_moe_cache() const {
+    GGML_ASSERT(moe_cache != nullptr);
+    if (output_priority != nullptr) {
+        return { output_priority, moe_cache_epoch };
+    }
+
+    auto inp = std::make_unique<llm_graph_input_moe_cache>(moe_cache);
+    inp->priority = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, ubatch.n_tokens);
+    inp->epoch = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, 1);
+    ggml_set_input(inp->priority);
+    ggml_set_input(inp->epoch);
+
+    output_priority = inp->priority;
+    moe_cache_epoch = inp->epoch;
+    res->add_input(std::move(inp));
+    return { output_priority, moe_cache_epoch };
 }
 
 ggml_tensor * llm_graph_context::build_inp_mean() const {

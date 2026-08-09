@@ -1697,6 +1697,7 @@ static bool ggml_cuda_get_expert_source_view(
     const char * data = static_cast<const char *>(ids_source->data);
     view.route_ids = reinterpret_cast<const int32_t *>(data + layout.route_ids_offset);
     view.route_bounds = reinterpret_cast<const int32_t *>(data + layout.route_bounds_offset);
+    view.route_tile_bounds = reinterpret_cast<int32_t *>(const_cast<char *>(data) + layout.route_tile_bounds_offset);
     return true;
 }
 

@@ -6,6 +6,7 @@ struct ggml_cuda_expert_source_view {
     const int32_t * selectors;
     const int32_t * route_ids;
     const int32_t * route_bounds;
+    int32_t * route_tile_bounds;
     int64_t selector_stride;
     uint32_t selector_width;
     const char * host_data;
@@ -23,6 +24,7 @@ struct ggml_cuda_expert_plan {
     // and are reused by every projection in the layer.
     int32_t * route_ids;
     int32_t * route_bounds;
+    int32_t * route_tile_bounds;
 
     int32_t * expert_order;
     int32_t * fill_expert;
@@ -32,7 +34,12 @@ struct ggml_cuda_expert_plan {
     int32_t * expert_to_cache;
     int32_t * cache_to_expert;
     uint64_t * last_used;
+    uint64_t * protected_epoch;
+    uint64_t * pending_priority_epoch;
     uint64_t * use_clock;
+
+    const int32_t * token_priority;
+    const int32_t * epoch;
 
     uint32_t * n_active;
     uint32_t * n_resident;
@@ -76,4 +83,11 @@ void ggml_cuda_launch_expert_plan_input_index(
         int nchannels_y,
         int sis1,
         bool write_inverse,
+        cudaStream_t stream);
+
+void ggml_cuda_launch_expert_route_tiles(
+        const int32_t * route_bounds,
+        int32_t * route_tile_bounds,
+        int n_experts,
+        int routes_per_tile,
         cudaStream_t stream);

@@ -3,6 +3,7 @@
 #include "common.cuh"
 #include "mmid.cuh"
 
+#include <algorithm>
 #include <climits>
 #include <cstdint>
 
@@ -922,7 +923,7 @@ template <ggml_type type, int J, bool fallback>
 __launch_bounds__(ggml_cuda_mmq_get_nthreads(type, J, fallback), ggml_cuda_mmq_get_occupancy(type, J, fallback))
 static __global__ void mul_mat_q(
         const char * __restrict__ x, const int * __restrict__ y, const int32_t * __restrict__ ids_dst,
-        const int32_t * __restrict__ expert_bounds, const int32_t * __restrict__ source_ids,
+        const int32_t * __restrict__ expert_bounds, const int32_t * __restrict__ expert_tile_bounds, const int32_t * __restrict__ source_ids,
         const char * __restrict__ source_host, const int source_host_stride,
         const int source_ids_stride, const int source_ids_width,
         float * __restrict__ dst, float * __restrict__ tmp_fixup,
@@ -962,10 +963,11 @@ static __global__ void mul_mat_q(
     __syncthreads();
 
     if constexpr (!ggml_cuda_mmq_get_stream_k(type, J, fallback)) {
-        const uint2 tmp2 = fast_div_modulo(blockIdx.z, nchannels_y);
+        const bool compact_routes = expert_tile_bounds != nullptr;
+        const uint2 tmp2 = compact_routes ? make_uint2(blockIdx.z, 0) : fast_div_modulo(blockIdx.z, nchannels_y);
         const int wt = tmp2.x;
-        const int zt = tmp2.y;
-        const int jt = blockIdx.y;
+        int zt = tmp2.y;
+        int jt = blockIdx.y;
         const int it = blockIdx.x;
 
         // Defaults for regular matrix multiplication:
@@ -982,6 +984,26 @@ static __global__ void mul_mat_q(
         }
 
         if (ids_dst) {
+            if (compact_routes) {
+                const int route_tile = blockIdx.y;
+                const int n_route_tiles = expert_tile_bounds[nchannels_y.z];
+                if (route_tile >= n_route_tiles) {
+                    return;
+                }
+
+                int lo = 0;
+                int hi = nchannels_y.z;
+                while (lo + 1 < hi) {
+                    const int mid = (lo + hi) / 2;
+                    if (expert_tile_bounds[mid] <= route_tile) {
+                        lo = mid;
+                    } else {
+                        hi = mid;
+                    }
+                }
+                zt = lo;
+                jt = route_tile - expert_tile_bounds[zt];
+            }
             col_low  = expert_bounds[zt + 0];
             col_high = expert_bounds[zt + 1];
             col_diff = col_high - col_low;
@@ -1386,7 +1408,7 @@ static __global__ void mul_mat_q_stream_k_fixup(
 }
 
 struct mmq_args {
-    const char * x; ggml_type type_x; const int * y; const int32_t * ids_dst; const int32_t * expert_bounds;
+    const char * x; ggml_type type_x; const int * y; const int32_t * ids_dst; const int32_t * expert_bounds; int32_t * expert_tile_bounds;
     const int32_t * source_ids; const char * source_host; int64_t source_host_stride;
     int64_t source_ids_stride; int64_t source_ids_width; float * dst;
     const float * y_scale;
@@ -1403,6 +1425,21 @@ static size_t mmq_get_nbytes_shared(const ggml_cuda_mmq_config & config, const i
     return nbs_ids + nbs_x + GGML_PAD(nbs_y, config.nthreads*sizeof(int));
 }
 
+static int64_t mmq_expert_route_tile_upper_bound(
+        int64_t n_routes,
+        int64_t n_experts,
+        int routes_per_tile) {
+    GGML_ASSERT(n_routes >= 0);
+    GGML_ASSERT(n_experts >= 0);
+    GGML_ASSERT(routes_per_tile > 0);
+
+    if (n_routes == 0 || n_experts == 0) {
+        return 0;
+    }
+
+    return (n_routes - 1)/routes_per_tile + 1 + std::min(n_experts, n_routes) - 1;
+}
+
 template <ggml_type type, int J, bool fallback>
 static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream) {
     const int id = ggml_cuda_get_device();
@@ -1414,6 +1451,8 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
     GGML_ASSERT(config.nthreads % warp_size == 0);
     const int nwarps = config.nthreads / warp_size;
     const int nbytes_shared = mmq_get_nbytes_shared(config, cc);
+    const bool use_stream_k = ggml_cuda_mmq_get_stream_k(type, J, fallback, cc);
+    int32_t * route_tile_bounds = use_stream_k ? nullptr : args.expert_tile_bounds;
 
     const dim3 block_dims(warp_size, nwarps, 1);
 
@@ -1421,8 +1460,21 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
     CUDA_SET_SHARED_MEMORY_LIMIT((mul_mat_q<type, J,  true>), nbytes_shared);
 
     const int nty  = (args.nrows_x   + config.I - 1) / config.I;
-    const int ntx  = (args.ncols_max + config.J - 1) / config.J;
-    const int ntzw = args.nchannels_y * args.nsamples_y;
+    const int64_t compact_route_tile_bound = route_tile_bounds
+        ? mmq_expert_route_tile_upper_bound(args.ncols_dst, args.nchannels_y, config.J)
+        : 0;
+    if (route_tile_bounds && compact_route_tile_bound == 0) {
+        return;
+    }
+    const int64_t ntx = route_tile_bounds
+        ? compact_route_tile_bound
+        : (args.ncols_max + config.J - 1) / config.J;
+    const int64_t ntzw = route_tile_bounds
+        ? args.nsamples_y
+        : args.nchannels_y*args.nsamples_y;
+    if (ntx == 0) {
+        return;
+    }
     const dim3 block_nums_xy_tiling(nty, ntx, ntzw);
 
     GGML_ASSERT(args.nchannels_y % args.nchannels_x == 0);
@@ -1437,9 +1489,14 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
     const uint3 channel_ratio_fd   = init_fastdiv_values(channel_ratio);
     const uint3 sample_ratio_fd    = init_fastdiv_values(sample_ratio);
 
-    if (!ggml_cuda_mmq_get_stream_k(type, J, fallback, cc)) {
+    if (route_tile_bounds) {
+        ggml_cuda_launch_expert_route_tiles(args.expert_bounds, route_tile_bounds,
+            args.nchannels_y, config.J, stream);
+    }
+
+    if (!use_stream_k) {
         mul_mat_q<type, J, fallback><<<block_nums_xy_tiling, block_dims, nbytes_shared, stream>>>
-            (args.x, args.y, args.ids_dst, args.expert_bounds, args.source_ids, args.source_host, args.source_host_stride,
+            (args.x, args.y, args.ids_dst, args.expert_bounds, route_tile_bounds, args.source_ids, args.source_host, args.source_host_stride,
              args.source_ids_stride, args.source_ids_width,
              args.dst, nullptr, args.y_scale,
              blocks_per_ne00_fd, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
@@ -1470,7 +1527,7 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
     const dim3 block_dims_fixup(block_dims.x, block_dims.y/2, block_dims.z);
 
     mul_mat_q<type, J, fallback><<<block_nums_stream_k, block_dims, nbytes_shared, stream>>>
-        (args.x, args.y, args.ids_dst, args.expert_bounds, args.source_ids, args.source_host, args.source_host_stride,
+        (args.x, args.y, args.ids_dst, args.expert_bounds, route_tile_bounds, args.source_ids, args.source_host, args.source_host_stride,
          args.source_ids_stride, args.source_ids_width,
          args.dst, tmp_fixup.ptr, args.y_scale,
          blocks_per_ne00_fd, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,

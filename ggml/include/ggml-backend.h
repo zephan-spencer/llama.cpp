@@ -224,7 +224,7 @@ extern "C" {
     typedef struct ggml_backend_feature * (*ggml_backend_get_features_t)(ggml_backend_reg_t reg);
 
     // Versioned MoE expert-cache backend extension.
-    #define GGML_BACKEND_MOE_CACHE_INTERFACE_VERSION 1
+    #define GGML_BACKEND_MOE_CACHE_INTERFACE_VERSION 2
     #define GGML_BACKEND_MOE_CACHE_MAX_WEIGHTS 4
     struct ggml_backend_moe_cache_stats {
         uint64_t resolve_calls;
@@ -259,7 +259,9 @@ extern "C" {
         struct ggml_backend_moe_cache_plan (*build_plan)(
             ggml_backend_moe_cache_t cache,
             struct ggml_context * ctx,
-            struct ggml_tensor * logical_ids);
+            struct ggml_tensor * logical_ids,
+            struct ggml_tensor * token_priority,
+            struct ggml_tensor * epoch);
         void (*get_stats)(ggml_backend_moe_cache_t cache, struct ggml_backend_moe_cache_stats * stats);
         void (*reset_stats)(ggml_backend_moe_cache_t cache);
     };

@@ -330,6 +330,43 @@ static void test_split(testing & t) {
         t.assert_equal(4, out_ids[0]);
     });
 
+    t.test("output_priority", [&](testing & t) {
+        batch_builder bb;
+        bb.add(0, {0}, true);
+        bb.add(0, {1}, false);
+        bb.add(1, {1}, true);
+        bb.add(0, {2}, true);
+
+        llama_batch_allocr ba(1);
+        t.assert_true(ba.init(bb.make(), vocab, nullptr, bb.n_embd, 4, false));
+
+        llama_ubatch ub = ba.split_simple(2);
+        t.assert_equal(1, ub.output_priority[0]);
+        t.assert_equal(0, ub.output_priority[1]);
+
+        ub = ba.split_simple(2);
+        t.assert_equal(0, ub.output_priority[0]);
+        t.assert_equal(1, ub.output_priority[1]);
+
+        const int32_t expected[] = { 1, 0, 0, 1 };
+        auto check_priority = [&](const llama_ubatch & current) {
+            for (uint32_t i = 0; i < current.n_tokens; ++i) {
+                const int32_t batch_index = current.embd[i*bb.n_embd] / 100.0f;
+                t.assert_equal(expected[batch_index], current.output_priority[i]);
+            }
+        };
+
+        ba.split_reset();
+        while ((ub = ba.split_equal(4, false, 0)).n_tokens != 0) {
+            check_priority(ub);
+        }
+
+        ba.split_reset();
+        while ((ub = ba.split_seq(2)).n_tokens != 0) {
+            check_priority(ub);
+        }
+    });
+
     t.test("split_reset_allows_resplit", [&](testing & t) {
         batch_builder bb;
         for (int i = 0; i < 3; ++i) {

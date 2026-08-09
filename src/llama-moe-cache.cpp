@@ -77,6 +77,7 @@ struct llama_moe_expert_cache::impl {
     std::unordered_set<ggml_backend_t> pending;
     ggml_backend_dev_t device = nullptr;
     bool info_printed = false;
+    uint32_t batch_epoch = 0;
 
     impl(const llama_model & model, const std::vector<ggml_backend_t> & backends, uint32_t n_cache)
         : model(model), backends(backends), n_cache(n_cache) {
@@ -251,6 +252,8 @@ llama_moe_cache_binding llama_moe_expert_cache::bind(
         ggml_backend_sched_t sched,
         int il,
         ggml_tensor * ids,
+        ggml_tensor * token_priority,
+        ggml_tensor * epoch,
         ggml_tensor * up,
         ggml_tensor * gate,
         ggml_tensor * down,
@@ -261,7 +264,7 @@ llama_moe_cache_binding llama_moe_expert_cache::bind(
     }
 
     ggml_tensor * logical_ids = ggml_is_contiguous(ids) ? ids : ggml_cont(ctx, ids);
-    const ggml_backend_moe_cache_plan plan = group->api->build_plan(group->handle, ctx, logical_ids);
+    const ggml_backend_moe_cache_plan plan = group->api->build_plan(group->handle, ctx, logical_ids, token_priority, epoch);
     if (plan.execution == nullptr || plan.selectors == nullptr ||
             !ggml_backend_dev_supports_op(ggml_backend_get_device(group->backend), plan.execution)) {
         throw std::runtime_error("MoE expert cache: backend cannot build route plan");
@@ -286,6 +289,17 @@ void llama_moe_expert_cache::synchronize() {
         ggml_backend_synchronize(backend);
     }
     pimpl->pending.clear();
+}
+
+void llama_moe_expert_cache::begin_batch() {
+    ++pimpl->batch_epoch;
+    if (pimpl->batch_epoch == 0) {
+        ++pimpl->batch_epoch;
+    }
+}
+
+uint32_t llama_moe_expert_cache::epoch() const {
+    return pimpl->batch_epoch;
 }
 
 void llama_moe_expert_cache::print_info() {

@@ -163,7 +163,7 @@ void ggml_cuda_mul_mat_q(
         const int64_t s13 = ne12*s12;
 
         const mmq_args args = {
-            src0_d, src0->type, (const int *) src1_q8_1.ptr, nullptr, nullptr, nullptr, nullptr, 0, 0, 0, dst_d,
+            src0_d, src0->type, (const int *) src1_q8_1.ptr, nullptr, nullptr, nullptr, nullptr, nullptr, 0, 0, 0, dst_d,
             src0->type == GGML_TYPE_NVFP4 && use_native_fp4 ? src1_scale.ptr : nullptr,
             ne00, ne01, ne1, s01, ne11, s1,
             ne02, ne12, s02, s12, s2,
@@ -266,6 +266,7 @@ void ggml_cuda_mul_mat_q(
         src0_d, src0->type, (const int *) src1_q8_1.get(),
         saved_routes ? source->route_ids : ids_dst.get(),
         saved_routes ? source->route_bounds : expert_bounds.get(),
+        saved_routes ? source->route_tile_bounds : nullptr,
         source != nullptr ? source->selectors : nullptr,
         source != nullptr ? source->host_data : nullptr,
         source != nullptr ? source->host_stride : 0,

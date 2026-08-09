@@ -50,6 +50,7 @@ struct llama_ubatch {
     llama_seq_id *  seq_id_unq; // [n_seqs_unq]       | s   | seq_id
     int32_t      *  seq_idx;    // [LLAMA_MAX_SEQ]    | -   | seq_idx
     int8_t       *  output;     // [n_tokens]         | i   | -
+    int32_t      *  output_priority; // [n_tokens]     | i   | exact-sequence-set output priority
 
     struct data_t {
         std::vector<llama_token>    token;
@@ -60,6 +61,7 @@ struct llama_ubatch {
         std::vector<llama_seq_id>   seq_id_unq;
         std::vector<int32_t>        seq_idx;
         std::vector<int8_t>         output;
+        std::vector<int32_t>        output_priority;
 
         std::vector<llama_seq_id> seq_id_data;
     };
@@ -145,6 +147,7 @@ private:
     std::vector<llama_seq_id>   seq_id_unq;
     std::vector<int32_t>        seq_idx;
     std::vector<int8_t>         output;
+    std::vector<int32_t>        output_priority;
 
     using pos_set_t = std::set<llama_pos>;
     using seq_cpl_t = std::vector<bool>;

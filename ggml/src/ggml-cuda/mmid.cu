@@ -111,6 +111,38 @@ void ggml_cuda_launch_expert_plan_input_index(
         route_ids, ids_src, n_routes, n_expert_used, nchannels_y, sis1, write_inverse);
 }
 
+static __global__ void expert_plan_route_tiles(
+        const int32_t * route_bounds,
+        int32_t * route_tile_bounds,
+        int n_experts,
+        int routes_per_tile) {
+    if (threadIdx.x != 0 || blockIdx.x != 0) {
+        return;
+    }
+
+    int32_t total = 0;
+    route_tile_bounds[0] = 0;
+    for (int expert = 0; expert < n_experts; ++expert) {
+        const int32_t routes = route_bounds[expert + 1] - route_bounds[expert];
+        total += (routes + routes_per_tile - 1) / routes_per_tile;
+        route_tile_bounds[expert + 1] = total;
+    }
+}
+
+void ggml_cuda_launch_expert_route_tiles(
+        const int32_t * route_bounds,
+        int32_t * route_tile_bounds,
+        int n_experts,
+        int routes_per_tile,
+        cudaStream_t stream) {
+    GGML_ASSERT(route_bounds != nullptr);
+    GGML_ASSERT(route_tile_bounds != nullptr);
+    GGML_ASSERT(n_experts > 0);
+    GGML_ASSERT(routes_per_tile > 0);
+
+    expert_plan_route_tiles<<<1, 1, 0, stream>>>(route_bounds, route_tile_bounds, n_experts, routes_per_tile);
+}
+
 static __global__ void expert_plan_cache(
         const int32_t * ids,
         ggml_cuda_expert_plan plan,
@@ -118,18 +150,36 @@ static __global__ void expert_plan_cache(
         int n_experts,
         int n_cache,
         int n_expert_used) {
+    enum admission_pass {
+        ADMIT_ACTIVE_PRIORITY,
+        ADMIT_PENDING_PRIORITY,
+        ADMIT_ACTIVE_PROMPT,
+        ADMIT_PASS_COUNT,
+    };
+
     extern __shared__ int32_t scratch[];
 
     int32_t * requested = scratch;
-    int32_t * unique = requested + n_experts;
+    int32_t * priority_requested = requested + n_experts;
+    int32_t * unique = priority_requested + n_experts;
 
     for (int expert = threadIdx.x; expert < n_experts; expert += blockDim.x) {
         requested[expert] = 0;
+        priority_requested[expert] = 0;
     }
     __syncthreads();
 
     if (threadIdx.x != 0) {
         return;
+    }
+
+    const uint64_t epoch = plan.epoch ? static_cast<uint64_t>(*plan.epoch) : 0;
+    if (epoch != 0) {
+        for (int expert = 0; expert < n_experts; ++expert) {
+            if (plan.pending_priority_epoch[expert] != epoch) {
+                plan.pending_priority_epoch[expert] = 0;
+            }
+        }
     }
 
     int32_t n_active = 0;
@@ -140,63 +190,89 @@ static __global__ void expert_plan_cache(
             requested[expert] = 1;
             unique[n_active++] = expert;
         }
-    }
-    int32_t n_resident = 0;
-    for (int32_t i = 0; i < n_active; ++i) {
-        const int32_t expert = unique[i];
-        if (plan.expert_to_cache[expert] >= 0) {
-            if (plan.expert_order != nullptr) {
-                plan.expert_order[n_resident] = expert;
-            }
-            n_resident++;
+        if (plan.token_priority != nullptr && plan.token_priority[i/n_expert_used] != 0) {
+            priority_requested[expert] = 1;
         }
     }
-
+    int32_t n_resident = 0;
     int32_t n_miss = 0;
     int32_t n_fill = 0;
     int32_t n_evictions = 0;
-    for (int32_t i = 0; i < n_active; ++i) {
-        const int32_t expert = unique[i];
-        if (plan.expert_to_cache[expert] >= 0) {
-            continue;
-        }
-        n_miss++;
-
-        int32_t victim = -1;
-        for (int32_t slot = 0; slot < n_cache; ++slot) {
-            if (plan.cache_to_expert[slot] < 0) {
-                victim = slot;
-                break;
+    for (int pass = ADMIT_ACTIVE_PRIORITY; pass < ADMIT_PASS_COUNT; ++pass) {
+        const bool pending_pass = pass == ADMIT_PENDING_PRIORITY;
+        const bool prompt_pass = pass == ADMIT_ACTIVE_PROMPT;
+        const int32_t n_candidates = pending_pass ? n_experts : n_active;
+        for (int32_t i = 0; i < n_candidates; ++i) {
+            const int32_t expert = pending_pass ? i : unique[i];
+            if ((pass == ADMIT_ACTIVE_PRIORITY && priority_requested[expert] == 0) ||
+                    (pending_pass && (epoch == 0 || plan.pending_priority_epoch[expert] != epoch || priority_requested[expert] != 0)) ||
+                    (prompt_pass && priority_requested[expert] != 0)) {
+                continue;
             }
-        }
 
-        if (victim < 0) {
-            uint64_t oldest = UINT64_MAX;
+            const int32_t resident_slot = plan.expert_to_cache[expert];
+            if (resident_slot >= 0) {
+                if (!pending_pass) {
+                    if (plan.expert_order != nullptr) {
+                        plan.expert_order[n_resident + n_fill] = expert;
+                    }
+                    n_resident++;
+                }
+                if (!prompt_pass && epoch != 0) {
+                    plan.protected_epoch[resident_slot] = epoch;
+                    plan.pending_priority_epoch[expert] = 0;
+                }
+                continue;
+            }
+            if (!pending_pass) {
+                n_miss++;
+            }
+
+            int32_t victim = -1;
             for (int32_t slot = 0; slot < n_cache; ++slot) {
-                const int32_t resident = plan.cache_to_expert[slot];
-                if (!requested[resident] && plan.last_used[slot] < oldest) {
-                    oldest = plan.last_used[slot];
+                if (plan.cache_to_expert[slot] < 0) {
                     victim = slot;
+                    break;
                 }
             }
-        }
-        if (victim < 0) {
-            continue;
-        }
 
-        const int32_t evicted = plan.cache_to_expert[victim];
-        if (evicted >= 0) {
-            plan.expert_to_cache[evicted] = -1;
-            n_evictions++;
-        }
+            if (victim < 0) {
+                uint64_t oldest = UINT64_MAX;
+                for (int32_t slot = 0; slot < n_cache; ++slot) {
+                    const int32_t resident = plan.cache_to_expert[slot];
+                    const bool protected_now = epoch != 0 && plan.protected_epoch[slot] == epoch;
+                    const bool active_now = requested[resident] != 0;
+                    if (!protected_now && !active_now && plan.last_used[slot] < oldest) {
+                        oldest = plan.last_used[slot];
+                        victim = slot;
+                    }
+                }
+            }
+            if (victim < 0) {
+                if (!prompt_pass && epoch != 0) {
+                    plan.pending_priority_epoch[expert] = epoch;
+                }
+                continue;
+            }
 
-        plan.cache_to_expert[victim] = expert;
-        if (plan.expert_order != nullptr) {
-            plan.expert_order[n_resident + n_fill] = expert;
+            const int32_t evicted = plan.cache_to_expert[victim];
+            if (evicted >= 0) {
+                plan.expert_to_cache[evicted] = -1;
+                n_evictions++;
+            }
+
+            plan.cache_to_expert[victim] = expert;
+            plan.protected_epoch[victim] = !prompt_pass && epoch != 0 ? epoch : 0;
+            if (!prompt_pass) {
+                plan.pending_priority_epoch[expert] = 0;
+            }
+            if (plan.expert_order != nullptr) {
+                plan.expert_order[n_resident + n_fill] = expert;
+            }
+            plan.fill_expert[n_fill] = expert;
+            plan.fill_slot[n_fill] = victim;
+            n_fill++;
         }
-        plan.fill_expert[n_fill] = expert;
-        plan.fill_slot[n_fill] = victim;
-        n_fill++;
     }
 
     for (int32_t i = 0; i < n_fill; ++i) {
@@ -212,6 +288,9 @@ static __global__ void expert_plan_cache(
         if (slot >= 0) {
             plan.last_used[slot] = use_clock;
         }
+    }
+    for (int32_t i = 0; i < n_fill; ++i) {
+        plan.last_used[plan.fill_slot[i]] = use_clock;
     }
 
     int32_t n_streamed = 0;
@@ -282,6 +361,8 @@ void ggml_cuda_launch_expert_cache_plan(
     GGML_ASSERT(plan.expert_to_cache != nullptr);
     GGML_ASSERT(plan.cache_to_expert != nullptr);
     GGML_ASSERT(plan.last_used != nullptr);
+    GGML_ASSERT(plan.protected_epoch != nullptr);
+    GGML_ASSERT(plan.pending_priority_epoch != nullptr);
     GGML_ASSERT(plan.use_clock != nullptr);
     GGML_ASSERT(plan.n_active != nullptr);
     GGML_ASSERT(plan.n_resident != nullptr);
@@ -305,7 +386,7 @@ void ggml_cuda_launch_expert_cache_plan(
             /*write_inverse=*/false, stream);
     }
 
-    const size_t shared_size = 2 * n_experts * sizeof(int32_t);
+    const size_t shared_size = 3 * n_experts * sizeof(int32_t);
     expert_plan_cache<<<1, 256, shared_size, stream>>>(
         ids,
         plan,

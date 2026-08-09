@@ -1466,6 +1466,10 @@ int llama_context::encode(const llama_batch & batch_inp) {
     //       ref: https://github.com/ggml-org/llama.cpp/pull/12181#issuecomment-2730451223
     cparams.causal_attn = false;
 
+    if (moe_cache) {
+        moe_cache->begin_batch();
+    }
+
     ggml_status status;
     const auto * res = process_ubatch(ubatch, LLM_GRAPH_TYPE_ENCODER, nullptr, status);
 
@@ -1796,6 +1800,10 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
     // handle any pending shifts/copies
     memory_update(false);
+
+    if (moe_cache) {
+        moe_cache->begin_batch();
+    }
 
     llama_memory_context_ptr mctx;
 

@@ -36,12 +36,16 @@ public:
             ggml_backend_sched_t sched,
             int il,
             ggml_tensor * ids,
+            ggml_tensor * token_priority,
+            ggml_tensor * epoch,
             ggml_tensor * up,
             ggml_tensor * gate,
             ggml_tensor * down,
             ggml_tensor * gate_up);
 
     void synchronize();
+    void begin_batch();
+    uint32_t epoch() const;
     void print_info();
     void print_stats() const;
     void reset_stats();

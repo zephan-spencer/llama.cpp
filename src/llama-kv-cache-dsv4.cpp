@@ -118,6 +118,7 @@ static llama_ubatch dsv4_build_raw_write_ubatch(const llama_ubatch & ubatch) {
     data->seq_id_unq.assign(ubatch.seq_id_unq, ubatch.seq_id_unq + ubatch.n_seqs_unq);
     data->seq_idx.assign(LLAMA_MAX_SEQ, -1);
     data->output.assign(n_tokens, 0);
+    data->output_priority.assign(n_tokens, 0);
     if (ubatch.token) {
         data->token.reserve(n_tokens);
     }
@@ -140,6 +141,7 @@ static llama_ubatch dsv4_build_raw_write_ubatch(const llama_ubatch & ubatch) {
             for (uint32_t p = 0; p < ubatch.n_pos; ++p) {
                 data->pos[(size_t) p*n_tokens + dst] = ubatch.pos[(size_t) p*ubatch.n_tokens + i];
             }
+            data->output_priority[dst] = ubatch.output_priority[i];
             data->n_seq_id.push_back(1);
             data->seq_id_data.push_back(seq_id);
         }
@@ -164,6 +166,7 @@ static llama_ubatch dsv4_build_raw_write_ubatch(const llama_ubatch & ubatch) {
         /*.seq_id_unq   =*/ data->seq_id_unq.data(),
         /*.seq_idx      =*/ data->seq_idx.data(),
         /*.output       =*/ data->output.data(),
+        /*.output_priority =*/ data->output_priority.data(),
         /*.data         =*/ data,
     };
 

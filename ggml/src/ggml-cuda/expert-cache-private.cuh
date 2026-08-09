@@ -3,7 +3,7 @@
 #include "ggml-backend.h"
 
 #define GGML_CUDA_EXPERT_CACHE_MAGIC 0x4558504341434845ULL
-#define GGML_CUDA_EXPERT_CACHE_VERSION 6
+#define GGML_CUDA_EXPERT_CACHE_VERSION 7
 #define GGML_CUDA_EXPERT_SOURCE_MAGIC 0x4558505352430001ULL
 #define GGML_CUDA_EXPERT_PLAN_MAGIC 0x455850504C414E01ULL
 
@@ -42,6 +42,8 @@ struct ggml_backend_cuda_expert_cache_desc {
     uint64_t expert_to_cache_offset;
     uint64_t cache_to_expert_offset;
     uint64_t last_used_offset;
+    uint64_t protected_epoch_offset;
+    uint64_t pending_priority_epoch_offset;
     uint64_t fill_expert_offset;
     uint64_t fill_slot_offset;
     uint64_t state_size;
@@ -52,6 +54,8 @@ struct ggml_backend_cuda_expert_layout {
     uint64_t expert_to_cache_offset;
     uint64_t cache_to_expert_offset;
     uint64_t last_used_offset;
+    uint64_t protected_epoch_offset;
+    uint64_t pending_priority_epoch_offset;
     uint64_t fill_expert_offset;
     uint64_t fill_slot_offset;
     uint64_t state_size;
@@ -61,6 +65,7 @@ struct ggml_backend_cuda_expert_route_layout {
     uint64_t selectors_offset;
     uint64_t route_ids_offset;
     uint64_t route_bounds_offset;
+    uint64_t route_tile_bounds_offset;
     uint64_t size;
 };
 struct ggml_backend_cuda_expert_plan_binding {
@@ -92,6 +97,10 @@ static inline ggml_backend_cuda_expert_layout ggml_cuda_expert_cache_layout(
     offset = layout.cache_to_expert_offset + n_cache*sizeof(int32_t);
     layout.last_used_offset = ggml_cuda_expert_cache_align(offset, alignof(uint64_t));
     offset = layout.last_used_offset + n_cache*sizeof(uint64_t);
+    layout.protected_epoch_offset = ggml_cuda_expert_cache_align(offset, alignof(uint64_t));
+    offset = layout.protected_epoch_offset + n_cache*sizeof(uint64_t);
+    layout.pending_priority_epoch_offset = ggml_cuda_expert_cache_align(offset, alignof(uint64_t));
+    offset = layout.pending_priority_epoch_offset + n_expert*sizeof(uint64_t);
     layout.fill_expert_offset = ggml_cuda_expert_cache_align(offset, alignof(int32_t));
     offset = layout.fill_expert_offset + n_cache*sizeof(int32_t);
     layout.fill_slot_offset = ggml_cuda_expert_cache_align(offset, alignof(int32_t));
@@ -108,7 +117,8 @@ static inline ggml_backend_cuda_expert_route_layout ggml_cuda_expert_cache_route
     layout.selectors_offset = 0;
     layout.route_ids_offset = n_routes*sizeof(int32_t);
     layout.route_bounds_offset = layout.route_ids_offset + n_routes*sizeof(int32_t);
-    layout.size = layout.route_bounds_offset + (n_expert + 1)*sizeof(int32_t);
+    layout.route_tile_bounds_offset = layout.route_bounds_offset + (n_expert + 1)*sizeof(int32_t);
+    layout.size = layout.route_tile_bounds_offset + (n_expert + 1)*sizeof(int32_t);
     return layout;
 }
 
