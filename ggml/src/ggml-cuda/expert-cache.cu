@@ -1,9 +1,8 @@
-#include "expert-cache.cuh"
 #include "expert-cache-private.cuh"
-#include "mmid.cuh"
-
+#include "expert-cache.cuh"
 #include "ggml-cuda.h"
 #include "ggml-impl.h"
+#include "mmid.cuh"
 
 #include <algorithm>
 #include <cstdint>
@@ -17,24 +16,23 @@ static bool ggml_backend_cuda_moe_cache_supports(ggml_backend_dev_t device) {
 }
 
 static size_t ggml_backend_cuda_moe_cache_state_size(uint32_t n_expert, uint32_t n_cache, uint32_t n_weights) {
-    if (n_expert == 0 || n_cache == 0 || n_cache >= n_expert ||
-            n_weights == 0 || n_weights > GGML_BACKEND_MOE_CACHE_MAX_WEIGHTS) {
+    if (n_expert == 0 || n_cache == 0 || n_cache >= n_expert || n_weights == 0 ||
+        n_weights > GGML_BACKEND_MOE_CACHE_MAX_WEIGHTS) {
         return 0;
     }
     return ggml_cuda_expert_cache_layout(n_expert, n_cache).state_size;
 }
 
-static ggml_backend_moe_cache_t ggml_backend_cuda_moe_cache_create(
-        ggml_backend_t backend,
-        ggml_tensor * state,
-        ggml_tensor * const * source,
-        ggml_tensor * const * slots,
-        uint32_t n_expert,
-        uint32_t n_cache,
-        uint32_t n_weights) {
+static ggml_backend_moe_cache_t ggml_backend_cuda_moe_cache_create(ggml_backend_t        backend,
+                                                                   ggml_tensor *         state,
+                                                                   ggml_tensor * const * source,
+                                                                   ggml_tensor * const * slots,
+                                                                   uint32_t              n_expert,
+                                                                   uint32_t              n_cache,
+                                                                   uint32_t              n_weights) {
     const size_t state_size = ggml_backend_cuda_moe_cache_state_size(n_expert, n_cache, n_weights);
     if (backend == nullptr || state_size == 0 || state == nullptr || source == nullptr || slots == nullptr ||
-            state->buffer == nullptr || ggml_nbytes(state) < state_size) {
+        state->buffer == nullptr || ggml_nbytes(state) < state_size) {
         return nullptr;
     }
 
@@ -43,47 +41,45 @@ static ggml_backend_moe_cache_t ggml_backend_cuda_moe_cache_create(
         return nullptr;
     }
 
-    auto * cache = new ggml_backend_moe_cache{};
-    cache->backend = backend;
-    cache->state = state;
-    auto & desc = cache->desc;
-    desc.magic = GGML_CUDA_EXPERT_CACHE_MAGIC;
-    desc.version = GGML_CUDA_EXPERT_CACHE_VERSION;
-    desc.n_expert = n_expert;
-    desc.n_cache = n_cache;
-    desc.n_weights = n_weights;
-    desc.state_size = state_size;
-    const auto layout = ggml_cuda_expert_cache_layout(n_expert, n_cache);
-    desc.expert_to_cache_offset = layout.expert_to_cache_offset;
-    desc.cache_to_expert_offset = layout.cache_to_expert_offset;
-    desc.last_used_offset = layout.last_used_offset;
-    desc.protected_epoch_offset = layout.protected_epoch_offset;
+    auto * cache                       = new ggml_backend_moe_cache{};
+    cache->backend                     = backend;
+    cache->state                       = state;
+    auto & desc                        = cache->desc;
+    desc.magic                         = GGML_CUDA_EXPERT_CACHE_MAGIC;
+    desc.version                       = GGML_CUDA_EXPERT_CACHE_VERSION;
+    desc.n_expert                      = n_expert;
+    desc.n_cache                       = n_cache;
+    desc.n_weights                     = n_weights;
+    desc.state_size                    = state_size;
+    const auto layout                  = ggml_cuda_expert_cache_layout(n_expert, n_cache);
+    desc.expert_to_cache_offset        = layout.expert_to_cache_offset;
+    desc.cache_to_expert_offset        = layout.cache_to_expert_offset;
+    desc.last_used_offset              = layout.last_used_offset;
+    desc.protected_epoch_offset        = layout.protected_epoch_offset;
     desc.pending_priority_epoch_offset = layout.pending_priority_epoch_offset;
-    desc.fill_expert_offset = layout.fill_expert_offset;
-    desc.fill_slot_offset = layout.fill_slot_offset;
+    desc.fill_expert_offset            = layout.fill_expert_offset;
+    desc.fill_slot_offset              = layout.fill_slot_offset;
     for (uint32_t i = 0; i < n_weights; ++i) {
-        if (source[i] == nullptr || slots[i] == nullptr || source[i]->buffer == nullptr ||
-                source[i]->data == nullptr || slots[i]->buffer == nullptr ||
-                !ggml_backend_buffer_is_host(source[i]->buffer) ||
-                ggml_backend_buffer_get_type(source[i]->buffer) != ggml_backend_dev_host_buffer_type(device) ||
-                ggml_backend_buft_get_device(ggml_backend_buffer_get_type(slots[i]->buffer)) != device ||
-                source[i]->type != slots[i]->type || source[i]->ne[0] != slots[i]->ne[0] ||
-                source[i]->ne[1] != slots[i]->ne[1] || source[i]->ne[2] != n_expert ||
-                source[i]->ne[3] != 1 || slots[i]->ne[2] != n_cache || slots[i]->ne[3] != 1 ||
-                source[i]->nb[2] != slots[i]->nb[2]) {
+        if (source[i] == nullptr || slots[i] == nullptr || source[i]->buffer == nullptr || source[i]->data == nullptr ||
+            slots[i]->buffer == nullptr || !ggml_backend_buffer_is_host(source[i]->buffer) ||
+            ggml_backend_buffer_get_type(source[i]->buffer) != ggml_backend_dev_host_buffer_type(device) ||
+            ggml_backend_buft_get_device(ggml_backend_buffer_get_type(slots[i]->buffer)) != device ||
+            source[i]->type != slots[i]->type || source[i]->ne[0] != slots[i]->ne[0] ||
+            source[i]->ne[1] != slots[i]->ne[1] || source[i]->ne[2] != n_expert || source[i]->ne[3] != 1 ||
+            slots[i]->ne[2] != n_cache || slots[i]->ne[3] != 1 || source[i]->nb[2] != slots[i]->nb[2]) {
             delete cache;
             return nullptr;
         }
     }
     for (uint32_t i = 0; i < n_weights; ++i) {
         const uint8_t * base = static_cast<const uint8_t *>(ggml_backend_buffer_get_base(source[i]->buffer));
-        desc.weights[i] = {
+        desc.weights[i]      = {
             base,
             nullptr,
             static_cast<uint64_t>(static_cast<const uint8_t *>(source[i]->data) - base),
             static_cast<uint64_t>(source[i]->nb[2]),
         };
-        cache->slots[i] = slots[i];
+        cache->slots[i]           = slots[i];
         cache->source_bindings[i] = {
             GGML_CUDA_EXPERT_SOURCE_MAGIC,
             n_expert,
@@ -97,8 +93,8 @@ static ggml_backend_moe_cache_t ggml_backend_cuda_moe_cache_create(
         cache,
     };
     std::vector<uint8_t> data(state_size, 0);
-    auto * expert_to_cache = reinterpret_cast<int32_t *>(data.data() + desc.expert_to_cache_offset);
-    auto * cache_to_expert = reinterpret_cast<int32_t *>(data.data() + desc.cache_to_expert_offset);
+    auto *               expert_to_cache = reinterpret_cast<int32_t *>(data.data() + desc.expert_to_cache_offset);
+    auto *               cache_to_expert = reinterpret_cast<int32_t *>(data.data() + desc.cache_to_expert_offset);
     std::fill(expert_to_cache, expert_to_cache + n_expert, -1);
     std::fill(cache_to_expert, cache_to_expert + n_cache, -1);
     ggml_backend_tensor_set(state, data.data(), 0, data.size());
@@ -117,60 +113,53 @@ static void ggml_backend_cuda_moe_cache_destroy(ggml_backend_moe_cache_t cache) 
     delete cache;
 }
 
-static ggml_backend_moe_cache_plan ggml_backend_cuda_moe_cache_build_plan(
-        ggml_backend_moe_cache_t cache,
-        ggml_context * ctx,
-        ggml_tensor * ids,
-        ggml_tensor * token_priority,
-        ggml_tensor * epoch) {
+static ggml_backend_moe_cache_plan ggml_backend_cuda_moe_cache_build_plan(ggml_backend_moe_cache_t cache,
+                                                                          ggml_context *           ctx,
+                                                                          ggml_tensor *            ids,
+                                                                          ggml_tensor *            token_priority,
+                                                                          ggml_tensor *            epoch) {
     if (cache == nullptr || ctx == nullptr || ids == nullptr || token_priority == nullptr || epoch == nullptr ||
-            ids->type != GGML_TYPE_I32 || token_priority->type != GGML_TYPE_I32 || epoch->type != GGML_TYPE_I32 ||
-            ggml_nelements(token_priority) != ids->ne[1] || ggml_nelements(epoch) != 1) {
+        ids->type != GGML_TYPE_I32 || token_priority->type != GGML_TYPE_I32 || epoch->type != GGML_TYPE_I32 ||
+        ggml_nelements(token_priority) != ids->ne[1] || ggml_nelements(epoch) != 1) {
         return { nullptr, nullptr };
     }
     const int64_t n_routes = ggml_nelements(ids);
-    const auto layout = ggml_cuda_expert_cache_route_layout(n_routes, cache->desc.n_expert);
+    const auto    layout   = ggml_cuda_expert_cache_route_layout(n_routes, cache->desc.n_expert);
     ggml_tensor * args[4 + GGML_BACKEND_MOE_CACHE_MAX_WEIGHTS] = {};
-    args[0] = ids;
-    args[1] = token_priority;
-    args[2] = epoch;
-    args[3] = cache->state;
+    args[0]                                                    = ids;
+    args[1]                                                    = token_priority;
+    args[2]                                                    = epoch;
+    args[3]                                                    = cache->state;
     for (uint32_t i = 0; i < cache->desc.n_weights; ++i) {
         args[4 + i] = cache->slots[i];
     }
-    auto * execution = ggml_custom_4d(
-        ctx, GGML_TYPE_I32, layout.size/sizeof(int32_t), 1, 1, 1,
-        args, 4 + cache->desc.n_weights, nullptr, 1, &cache->desc);
-    auto * selectors = ggml_view_4d(
-        ctx, execution, ids->ne[0], ids->ne[1], ids->ne[2], ids->ne[3],
-        ids->nb[1], ids->nb[2], ids->nb[3], layout.selectors_offset);
+    auto * execution = ggml_custom_4d(ctx, GGML_TYPE_I32, layout.size / sizeof(int32_t), 1, 1, 1, args,
+                                      4 + cache->desc.n_weights, nullptr, 1, &cache->desc);
+    auto * selectors = ggml_view_4d(ctx, execution, ids->ne[0], ids->ne[1], ids->ne[2], ids->ne[3], ids->nb[1],
+                                    ids->nb[2], ids->nb[3], layout.selectors_offset);
     selectors->extra = &cache->plan_binding;
     return { selectors, execution };
 }
 
-static void ggml_backend_cuda_moe_cache_get_stats(
-        ggml_backend_moe_cache_t cache,
-        ggml_backend_moe_cache_stats * stats) {
+static void ggml_backend_cuda_moe_cache_get_stats(ggml_backend_moe_cache_t       cache,
+                                                  ggml_backend_moe_cache_stats * stats) {
     ggml_backend_cuda_expert_cache_state state = {};
     ggml_backend_tensor_get(cache->state, &state, 0, sizeof(state));
-    *stats = state.stats;
+    *stats               = state.stats;
     stats->wall_clock_hz = cache->desc.wall_clock_hz;
 }
 
 static void ggml_backend_cuda_moe_cache_reset_stats(ggml_backend_moe_cache_t cache) {
     const ggml_backend_moe_cache_stats zero = {};
     ggml_backend_tensor_set_async(cache->backend, cache->state, &zero,
-        offsetof(ggml_backend_cuda_expert_cache_state, stats), sizeof(zero));
+                                  offsetof(ggml_backend_cuda_expert_cache_state, stats), sizeof(zero));
 }
+
 static const ggml_backend_moe_cache_i ggml_backend_cuda_moe_cache_interface = {
-    GGML_BACKEND_MOE_CACHE_INTERFACE_VERSION,
-    ggml_backend_cuda_moe_cache_supports,
-    ggml_backend_cuda_moe_cache_state_size,
-    ggml_backend_cuda_moe_cache_create,
-    ggml_backend_cuda_moe_cache_destroy,
-    ggml_backend_cuda_moe_cache_build_plan,
-    ggml_backend_cuda_moe_cache_get_stats,
-    ggml_backend_cuda_moe_cache_reset_stats,
+    GGML_BACKEND_MOE_CACHE_INTERFACE_VERSION, ggml_backend_cuda_moe_cache_supports,
+    ggml_backend_cuda_moe_cache_state_size,   ggml_backend_cuda_moe_cache_create,
+    ggml_backend_cuda_moe_cache_destroy,      ggml_backend_cuda_moe_cache_build_plan,
+    ggml_backend_cuda_moe_cache_get_stats,    ggml_backend_cuda_moe_cache_reset_stats,
 };
 
 extern "C" const ggml_backend_moe_cache_i * ggml_backend_cuda_moe_cache_get_interface() {
@@ -179,23 +168,23 @@ extern "C" const ggml_backend_moe_cache_i * ggml_backend_cuda_moe_cache_get_inte
 
 struct expert_cache_weight {
     const uint8_t * host;
-    uint8_t * cache;
-    uint64_t size;
+    uint8_t *       cache;
+    uint64_t        size;
 };
 
 struct expert_cache_params {
     expert_cache_weight weights[GGML_BACKEND_MOE_CACHE_MAX_WEIGHTS];
-    uint32_t n_expert;
-    uint32_t n_cache;
-    uint32_t n_weights;
-    uint32_t n_routes;
-    uint64_t expert_to_cache_offset;
-    uint64_t cache_to_expert_offset;
-    uint64_t last_used_offset;
-    uint64_t protected_epoch_offset;
-    uint64_t pending_priority_epoch_offset;
-    uint64_t fill_expert_offset;
-    uint64_t fill_slot_offset;
+    uint32_t            n_expert;
+    uint32_t            n_cache;
+    uint32_t            n_weights;
+    uint32_t            n_routes;
+    uint64_t            expert_to_cache_offset;
+    uint64_t            cache_to_expert_offset;
+    uint64_t            last_used_offset;
+    uint64_t            protected_epoch_offset;
+    uint64_t            pending_priority_epoch_offset;
+    uint64_t            fill_expert_offset;
+    uint64_t            fill_slot_offset;
 };
 
 static ggml_backend_cuda_expert_cache_desc * expert_cache_desc(const ggml_tensor * dst) {
@@ -216,9 +205,7 @@ static ggml_backend_cuda_expert_cache_desc * expert_cache_desc(const ggml_tensor
     return desc;
 }
 
-static __global__ void expert_cache_record_plan_kernel(
-        uint8_t * state_data,
-        expert_cache_params params) {
+static __global__ void expert_cache_record_plan_kernel(uint8_t * state_data, expert_cache_params params) {
     auto * header = reinterpret_cast<ggml_backend_cuda_expert_cache_state *>(state_data);
     if (threadIdx.x != 0) {
         return;
@@ -245,13 +232,11 @@ static __global__ void expert_cache_record_plan_kernel(
     }
 }
 
-static __global__ void expert_cache_copy_kernel(
-        uint8_t * state_data,
-        expert_cache_params params) {
-    auto * header = reinterpret_cast<ggml_backend_cuda_expert_cache_state *>(state_data);
-    const auto * fill_expert = reinterpret_cast<const int32_t *>(state_data + params.fill_expert_offset);
-    const auto * fill_slot = reinterpret_cast<const int32_t *>(state_data + params.fill_slot_offset);
-    const uint32_t n_fills = header->n_fills;
+static __global__ void expert_cache_copy_kernel(uint8_t * state_data, expert_cache_params params) {
+    auto *         header      = reinterpret_cast<ggml_backend_cuda_expert_cache_state *>(state_data);
+    const auto *   fill_expert = reinterpret_cast<const int32_t *>(state_data + params.fill_expert_offset);
+    const auto *   fill_slot   = reinterpret_cast<const int32_t *>(state_data + params.fill_slot_offset);
+    const uint32_t n_fills     = header->n_fills;
 
     uint64_t vectors_per_fill = 0;
     for (uint32_t weight = 0; weight < params.n_weights; ++weight) {
@@ -259,23 +244,22 @@ static __global__ void expert_cache_copy_kernel(
     }
 
     const uint64_t n_vectors = n_fills * vectors_per_fill;
-    for (uint64_t i = (uint64_t) blockIdx.x * blockDim.x + threadIdx.x;
-            i < n_vectors;
-            i += (uint64_t) gridDim.x * blockDim.x) {
-        const uint32_t fill = i / vectors_per_fill;
-        uint64_t weight_offset = i - fill * vectors_per_fill;
-        uint32_t weight = 0;
+    for (uint64_t i = (uint64_t) blockIdx.x * blockDim.x + threadIdx.x; i < n_vectors;
+         i += (uint64_t) gridDim.x * blockDim.x) {
+        const uint32_t fill          = i / vectors_per_fill;
+        uint64_t       weight_offset = i - fill * vectors_per_fill;
+        uint32_t       weight        = 0;
         while (weight_offset >= params.weights[weight].size / sizeof(uint4)) {
             weight_offset -= params.weights[weight].size / sizeof(uint4);
             weight++;
         }
 
         const expert_cache_weight cached = params.weights[weight];
-        const uint64_t expert = fill_expert[fill];
-        const uint64_t slot = fill_slot[fill];
-        const auto * src = reinterpret_cast<const uint4 *>(cached.host + expert * cached.size);
-        auto * dst = reinterpret_cast<uint4 *>(cached.cache + slot * cached.size);
-        dst[weight_offset] = src[weight_offset];
+        const uint64_t            expert = fill_expert[fill];
+        const uint64_t            slot   = fill_slot[fill];
+        const auto *              src    = reinterpret_cast<const uint4 *>(cached.host + expert * cached.size);
+        auto *                    dst    = reinterpret_cast<uint4 *>(cached.cache + slot * cached.size);
+        dst[weight_offset]               = src[weight_offset];
     }
 
     __syncthreads();
@@ -289,24 +273,24 @@ static __global__ void expert_cache_copy_kernel(
 
 bool ggml_cuda_expert_cache_supported(const ggml_tensor * dst) {
     ggml_backend_cuda_expert_cache_desc * desc = expert_cache_desc(dst);
-    if (desc == nullptr || desc->n_weights == 0 ||
-            desc->n_weights > GGML_BACKEND_MOE_CACHE_MAX_WEIGHTS) {
+    if (desc == nullptr || desc->n_weights == 0 || desc->n_weights > GGML_BACKEND_MOE_CACHE_MAX_WEIGHTS) {
         return false;
     }
-    if (dst->type != GGML_TYPE_I32 || dst->src[0] == nullptr || dst->src[0]->type != GGML_TYPE_I32 || !ggml_is_contiguous(dst->src[0])) {
+    if (dst->type != GGML_TYPE_I32 || dst->src[0] == nullptr || dst->src[0]->type != GGML_TYPE_I32 ||
+        !ggml_is_contiguous(dst->src[0])) {
         return false;
     }
-    const size_t n_routes = ggml_nelements(dst->src[0]);
-    const auto route_layout = ggml_cuda_expert_cache_route_layout(n_routes, desc->n_expert);
+    const size_t n_routes     = ggml_nelements(dst->src[0]);
+    const auto   route_layout = ggml_cuda_expert_cache_route_layout(n_routes, desc->n_expert);
     if (ggml_nbytes(dst) < route_layout.size) {
         return false;
     }
     if (dst->src[1] == nullptr || dst->src[1]->type != GGML_TYPE_I32 || !ggml_is_contiguous(dst->src[1]) ||
-            ggml_nelements(dst->src[1]) != dst->src[0]->ne[1]) {
+        ggml_nelements(dst->src[1]) != dst->src[0]->ne[1]) {
         return false;
     }
     if (dst->src[2] == nullptr || dst->src[2]->type != GGML_TYPE_I32 || !ggml_is_contiguous(dst->src[2]) ||
-            ggml_nelements(dst->src[2]) != 1) {
+        ggml_nelements(dst->src[2]) != 1) {
         return false;
     }
     if (desc->n_expert == 0 || desc->n_cache == 0 || desc->n_cache > desc->n_expert) {
@@ -317,10 +301,8 @@ bool ggml_cuda_expert_cache_supported(const ggml_tensor * dst) {
         return false;
     }
     for (uint32_t i = 0; i < desc->n_weights; ++i) {
-        if (dst->src[state_index + 1 + i] == nullptr ||
-                desc->weights[i].host_data == nullptr ||
-                desc->weights[i].expert_size == 0 ||
-                desc->weights[i].expert_size % sizeof(uint4) != 0) {
+        if (dst->src[state_index + 1 + i] == nullptr || desc->weights[i].host_data == nullptr ||
+            desc->weights[i].expert_size == 0 || desc->weights[i].expert_size % sizeof(uint4) != 0) {
             return false;
         }
     }
@@ -332,9 +314,9 @@ static void expert_cache_prepare_clock(ggml_backend_cuda_expert_cache_desc * des
         return;
     }
 
-    int device = 0;
-    int wall_clock_khz = 0;
-    hipError_t error = hipGetDevice(&device);
+    int        device         = 0;
+    int        wall_clock_khz = 0;
+    hipError_t error          = hipGetDevice(&device);
     if (error != hipSuccess) {
         GGML_ABORT("failed to get expert cache device: %s", hipGetErrorString(error));
     }
@@ -352,27 +334,27 @@ void ggml_cuda_expert_cache(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
     expert_cache_prepare_clock(desc);
 
     const int priority_index = 1;
-    const int epoch_index = 2;
-    const int state_index = 3;
+    const int epoch_index    = 2;
+    const int state_index    = 3;
 
-    expert_cache_params params = {};
-    params.n_expert = desc->n_expert;
-    params.n_cache = desc->n_cache;
-    params.n_weights = desc->n_weights;
-    params.n_routes = ggml_nelements(dst->src[0]);
-    params.expert_to_cache_offset = desc->expert_to_cache_offset;
-    params.cache_to_expert_offset = desc->cache_to_expert_offset;
-    params.last_used_offset = desc->last_used_offset;
-    params.protected_epoch_offset = desc->protected_epoch_offset;
+    expert_cache_params params           = {};
+    params.n_expert                      = desc->n_expert;
+    params.n_cache                       = desc->n_cache;
+    params.n_weights                     = desc->n_weights;
+    params.n_routes                      = ggml_nelements(dst->src[0]);
+    params.expert_to_cache_offset        = desc->expert_to_cache_offset;
+    params.cache_to_expert_offset        = desc->cache_to_expert_offset;
+    params.last_used_offset              = desc->last_used_offset;
+    params.protected_epoch_offset        = desc->protected_epoch_offset;
     params.pending_priority_epoch_offset = desc->pending_priority_epoch_offset;
-    params.fill_expert_offset = desc->fill_expert_offset;
-    params.fill_slot_offset = desc->fill_slot_offset;
+    params.fill_expert_offset            = desc->fill_expert_offset;
+    params.fill_slot_offset              = desc->fill_slot_offset;
 
     for (uint32_t i = 0; i < desc->n_weights; ++i) {
         if (desc->weights[i].device_data == nullptr) {
-            void * device_data = nullptr;
-            const hipError_t error = hipHostGetDevicePointer(
-                &device_data, const_cast<void *>(desc->weights[i].host_data), 0);
+            void *           device_data = nullptr;
+            const hipError_t error =
+                hipHostGetDevicePointer(&device_data, const_cast<void *>(desc->weights[i].host_data), 0);
             if (error != hipSuccess) {
                 GGML_ABORT("failed to map expert cache host weight: %s", hipGetErrorString(error));
             }
@@ -387,53 +369,48 @@ void ggml_cuda_expert_cache(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
     }
 
     uint8_t * state_data = static_cast<uint8_t *>(dst->src[state_index]->data);
-    auto * header = reinterpret_cast<ggml_backend_cuda_expert_cache_state *>(state_data);
+    auto *    header     = reinterpret_cast<ggml_backend_cuda_expert_cache_state *>(state_data);
 
     ggml_cuda_expert_plan plan = {};
-    plan.fill_expert = reinterpret_cast<int32_t *>(state_data + params.fill_expert_offset);
-    plan.fill_slot = reinterpret_cast<int32_t *>(state_data + params.fill_slot_offset);
-    const auto route_layout = ggml_cuda_expert_cache_route_layout(params.n_routes, desc->n_expert);
+    plan.fill_expert           = reinterpret_cast<int32_t *>(state_data + params.fill_expert_offset);
+    plan.fill_slot             = reinterpret_cast<int32_t *>(state_data + params.fill_slot_offset);
+    const auto route_layout    = ggml_cuda_expert_cache_route_layout(params.n_routes, desc->n_expert);
     plan.cache_ids = reinterpret_cast<int32_t *>(static_cast<uint8_t *>(dst->data) + route_layout.selectors_offset);
     const size_t n_routes = params.n_routes;
     plan.route_ids = reinterpret_cast<int32_t *>(static_cast<uint8_t *>(dst->data) + route_layout.route_ids_offset);
-    plan.route_bounds = reinterpret_cast<int32_t *>(static_cast<uint8_t *>(dst->data) + route_layout.route_bounds_offset);
-    plan.route_tile_bounds = reinterpret_cast<int32_t *>(static_cast<uint8_t *>(dst->data) + route_layout.route_tile_bounds_offset);
-    plan.expert_to_cache = reinterpret_cast<int32_t *>(state_data + params.expert_to_cache_offset);
-    plan.cache_to_expert = reinterpret_cast<int32_t *>(state_data + params.cache_to_expert_offset);
-    plan.last_used = reinterpret_cast<uint64_t *>(state_data + params.last_used_offset);
-    plan.protected_epoch = reinterpret_cast<uint64_t *>(state_data + params.protected_epoch_offset);
+    plan.route_bounds =
+        reinterpret_cast<int32_t *>(static_cast<uint8_t *>(dst->data) + route_layout.route_bounds_offset);
+    plan.route_first = reinterpret_cast<int32_t *>(static_cast<uint8_t *>(dst->data) + route_layout.route_first_offset);
+    plan.route_priority =
+        reinterpret_cast<int32_t *>(static_cast<uint8_t *>(dst->data) + route_layout.route_priority_offset);
+    plan.route_tile_bounds =
+        reinterpret_cast<int32_t *>(static_cast<uint8_t *>(dst->data) + route_layout.route_tile_bounds_offset);
+    plan.expert_to_cache        = reinterpret_cast<int32_t *>(state_data + params.expert_to_cache_offset);
+    plan.cache_to_expert        = reinterpret_cast<int32_t *>(state_data + params.cache_to_expert_offset);
+    plan.last_used              = reinterpret_cast<uint64_t *>(state_data + params.last_used_offset);
+    plan.protected_epoch        = reinterpret_cast<uint64_t *>(state_data + params.protected_epoch_offset);
     plan.pending_priority_epoch = reinterpret_cast<uint64_t *>(state_data + params.pending_priority_epoch_offset);
-    plan.token_priority = static_cast<const int32_t *>(dst->src[priority_index]->data);
-    plan.epoch = static_cast<const int32_t *>(dst->src[epoch_index]->data);
-    plan.use_clock = &header->use_clock;
-    plan.n_active = &header->n_active;
-    plan.n_resident = &header->n_resident;
-    plan.n_miss = &header->n_misses;
-    plan.n_fill = &header->n_fills;
-    plan.n_evictions = &header->n_evictions;
-    plan.n_streamed = &header->n_streamed;
-    plan.n_host_experts = &header->n_host_experts;
+    plan.token_priority         = static_cast<const int32_t *>(dst->src[priority_index]->data);
+    plan.epoch                  = static_cast<const int32_t *>(dst->src[epoch_index]->data);
+    plan.use_clock              = &header->use_clock;
+    plan.n_active               = &header->n_active;
+    plan.n_resident             = &header->n_resident;
+    plan.n_miss                 = &header->n_misses;
+    plan.n_fill                 = &header->n_fills;
+    plan.n_evictions            = &header->n_evictions;
+    plan.n_streamed             = &header->n_streamed;
+    plan.n_host_experts         = &header->n_host_experts;
 
     const int n_expert_used = dst->src[0]->ne[0];
-    const int n_tokens = ggml_nelements(dst->src[0]) / n_expert_used;
-    ggml_cuda_launch_expert_cache_plan(
-        static_cast<const int32_t *>(dst->src[0]->data),
-        plan,
-        desc->n_expert,
-        n_tokens,
-        n_expert_used,
-        desc->n_cache,
-        ctx.stream());
+    const int n_tokens      = ggml_nelements(dst->src[0]) / n_expert_used;
+    ggml_cuda_launch_expert_cache_plan(static_cast<const int32_t *>(dst->src[0]->data), plan, desc->n_expert, n_tokens,
+                                       n_expert_used, desc->n_cache, ctx.stream());
     CUDA_CHECK(cudaGetLastError());
 
-    expert_cache_record_plan_kernel<<<1, 1, 0, ctx.stream()>>>(
-        state_data,
-        params);
+    expert_cache_record_plan_kernel<<<1, 1, 0, ctx.stream()>>>(state_data, params);
     CUDA_CHECK(cudaGetLastError());
 
-    expert_cache_copy_kernel<<<32, 256, 0, ctx.stream()>>>(
-        state_data,
-        params);
+    expert_cache_copy_kernel<<<32, 256, 0, ctx.stream()>>>(state_data, params);
     CUDA_CHECK(cudaGetLastError());
 }
 
