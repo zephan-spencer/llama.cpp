@@ -2,6 +2,14 @@
 
 #include <cstdint>
 
+struct ggml_backend_moe_cache_stats;
+
+struct ggml_cuda_expert_route_plan {
+    int32_t first_route;
+    int32_t priority;
+    int32_t source;
+};
+
 struct ggml_cuda_expert_source_view {
     const int32_t * selectors;
     const int32_t * route_ids;
@@ -22,11 +30,10 @@ struct ggml_cuda_expert_plan {
     // Optional route data produced by the cache planner.  Unlike ids_dst and
     // expert_bounds above, these buffers are owned by the cache-plan output
     // and are reused by every projection in the layer.
-    int32_t * route_ids;
-    int32_t * route_bounds;
-    int32_t * route_first;
-    int32_t * route_priority;
-    int32_t * route_tile_bounds;
+    int32_t *                     route_ids;
+    int32_t *                     route_bounds;
+    ggml_cuda_expert_route_plan * route_plan;
+    int32_t *                     route_tile_bounds;
 
     int32_t * expert_order;
     int32_t * fill_expert;
@@ -50,6 +57,13 @@ struct ggml_cuda_expert_plan {
     uint32_t * n_evictions;
     uint32_t * n_streamed;
     uint32_t * n_host_experts;
+
+    ggml_backend_moe_cache_stats * stats;
+    uint64_t *                     fill_start_ticks;
+    uint32_t *                     copy_blocks_done;
+    uint32_t *                     resolve_active;
+    uint32_t *                     policy_flags;
+    uint64_t                       bytes_per_fill;
 };
 
 void ggml_cuda_launch_expert_plan(const int32_t *               ids,

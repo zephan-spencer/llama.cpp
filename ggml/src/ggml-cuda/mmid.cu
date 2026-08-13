@@ -5,9 +5,13 @@ static __global__ void expert_plan_routes_all(const int32_t * __restrict__ ids,
                                               int32_t * __restrict__ ids_src1,
                                               int32_t * __restrict__ ids_dst,
                                               int32_t * __restrict__ expert_bounds,
-                                              int32_t * __restrict__ expert_first,
-                                              int32_t * __restrict__ expert_priority,
+                                              ggml_cuda_expert_route_plan * __restrict__ route_plan,
+                                              const int32_t * __restrict__ expert_to_cache,
+                                              int32_t * __restrict__ cache_ids,
                                               const int32_t * __restrict__ token_priority,
+                                              int32_t * __restrict__ active_experts,
+                                              uint32_t * __restrict__ resolve_active,
+                                              uint32_t * __restrict__ policy_flags,
                                               const int  n_tokens,
                                               const int  n_expert_used,
                                               const int  nchannels_y,
@@ -35,13 +39,17 @@ static __global__ void expert_plan_routes_all(const int32_t * __restrict__ ids,
         const int  prefix    = warp_prefix_inclusive_sum<int, warp_size>(match ? 1 : 0);
         const int  n_matches = warp_reduce_sum<warp_size>(match ? 1 : 0);
 
-        if (expert_priority != nullptr && match && token_priority[route / n_expert_used] != 0) {
+        if (route_plan != nullptr && match && token_priority[route / n_expert_used] != 0) {
             priority_requested = 1;
         }
 
         if (match) {
             const int compact = nex_prev + it_compact + prefix - 1;
             ids_dst[compact]  = route;
+            if (route_plan != nullptr) {
+                const int32_t slot = expert_to_cache[expert];
+                cache_ids[route]   = slot >= 0 ? slot : -expert - 1;
+            }
             if (ids_src1 != nullptr) {
                 if (write_inverse) {
                     ids_src1[route] = compact;
@@ -56,20 +64,28 @@ static __global__ void expert_plan_routes_all(const int32_t * __restrict__ ids,
         it_compact += n_matches;
     }
 
-    if (expert_first != nullptr && it_compact > 0) {
+    if (route_plan != nullptr && it_compact > 0) {
         __syncwarp();
     }
-    if (expert_priority != nullptr && it_compact > 0) {
+    if (route_plan != nullptr && it_compact > 0) {
         priority_requested = warp_reduce_any<warp_size>(priority_requested);
     }
 
     if (lane == 0) {
         expert_bounds[expert] = nex_prev;
-        if (expert_first != nullptr) {
-            expert_first[expert] = it_compact > 0 ? ids_dst[nex_prev] : n_routes;
-        }
-        if (expert_priority != nullptr) {
-            expert_priority[expert] = priority_requested;
+        if (route_plan != nullptr) {
+            const int32_t slot = expert_to_cache[expert];
+            route_plan[expert] = {
+                it_compact > 0 ? ids_dst[nex_prev] : n_routes,
+                priority_requested,
+                slot >= 0 ? slot : -expert - 1,
+            };
+            if (it_compact > 0) {
+                active_experts[atomicAdd(resolve_active, 1u)] = expert;
+                if (slot < 0) {
+                    atomicOr(policy_flags, 1u);
+                }
+            }
         }
         if (expert == gridDim.x - 1) {
             expert_bounds[gridDim.x] = nex_prev + it_compact;
@@ -81,9 +97,13 @@ static void launch_expert_plan_routes(const int32_t * __restrict__ ids,
                                       int32_t * __restrict__ ids_src1,
                                       int32_t * __restrict__ ids_dst,
                                       int32_t * __restrict__ expert_bounds,
-                                      int32_t * __restrict__ expert_first,
-                                      int32_t * __restrict__ expert_priority,
+                                      ggml_cuda_expert_route_plan * __restrict__ route_plan,
+                                      const int32_t * __restrict__ expert_to_cache,
+                                      int32_t * __restrict__ cache_ids,
                                       const int32_t * __restrict__ token_priority,
+                                      int32_t * __restrict__ active_experts,
+                                      uint32_t * __restrict__ resolve_active,
+                                      uint32_t * __restrict__ policy_flags,
                                       const int    n_experts,
                                       const int    n_tokens,
                                       const int    n_expert_used_var,
@@ -96,8 +116,8 @@ static void launch_expert_plan_routes(const int32_t * __restrict__ ids,
     const dim3 num_blocks(n_experts, 1, 1);
     const dim3 block_size(warp_size, 1, 1);
     expert_plan_routes_all<<<num_blocks, block_size, 0, stream>>>(
-        ids, ids_src1, ids_dst, expert_bounds, expert_first, expert_priority, token_priority, n_tokens,
-        n_expert_used_var, nchannels_y, si1, sis1, write_inverse);
+        ids, ids_src1, ids_dst, expert_bounds, route_plan, expert_to_cache, cache_ids, token_priority, active_experts,
+        resolve_active, policy_flags, n_tokens, n_expert_used_var, nchannels_y, si1, sis1, write_inverse);
 }
 
 static __global__ void expert_plan_input_index(const int32_t * __restrict__ route_ids,
@@ -185,118 +205,183 @@ static __global__ void expert_plan_cache(ggml_cuda_expert_plan plan, int n_exper
         ADMIT_ACTIVE_PROMPT,
         ADMIT_PASS_COUNT,
     };
+    constexpr uint32_t POLICY_MISS    = 1u;
+    constexpr uint32_t POLICY_PENDING = 2u;
 
     extern __shared__ uint64_t active_routes[];
 
     const int32_t n_routes = plan.route_bounds[n_experts];
+    if ((*plan.policy_flags & (POLICY_MISS | POLICY_PENDING)) == 0) {
+        if (threadIdx.x == 0) {
+            const int32_t  n_active = *plan.resolve_active;
+            const uint64_t epoch    = plan.epoch ? static_cast<uint64_t>(*plan.epoch) : 0;
+            const uint64_t use_clock = n_active == 0 ? *plan.use_clock : ++*plan.use_clock;
+            for (int32_t i = 0; i < n_active; ++i) {
+                const int32_t expert = plan.expert_order[i];
+                const int32_t slot   = plan.expert_to_cache[expert];
+                plan.last_used[slot] = use_clock;
+                if (epoch != 0 && plan.route_plan[expert].priority != 0) {
+                    plan.protected_epoch[slot] = epoch;
+                }
+            }
+
+            *plan.n_active       = n_active;
+            *plan.n_resident     = n_active;
+            *plan.n_miss         = 0;
+            *plan.n_fill         = 0;
+            *plan.n_evictions    = 0;
+            *plan.n_streamed     = 0;
+            *plan.n_host_experts = 0;
+            *plan.resolve_active = 0;
+
+            if (plan.stats != nullptr) {
+                plan.stats->resolve_calls++;
+                plan.stats->update_touches += n_active;
+                plan.stats->resident_routes += n_routes;
+                plan.stats->cache_hits += n_active;
+                *plan.copy_blocks_done = 0;
+            }
+        }
+        return;
+    }
+
     for (int expert = threadIdx.x; expert < n_experts; expert += blockDim.x) {
-        active_routes[expert] = (static_cast<uint64_t>(plan.route_first[expert]) << 32) | static_cast<uint32_t>(expert);
+        active_routes[expert] =
+            (static_cast<uint64_t>(plan.route_plan[expert].first_route) << 32) | static_cast<uint32_t>(expert);
     }
     __syncthreads();
 
     if (threadIdx.x == 0) {
-        const uint64_t epoch = plan.epoch ? static_cast<uint64_t>(*plan.epoch) : 0;
+        const uint64_t epoch       = plan.epoch ? static_cast<uint64_t>(*plan.epoch) : 0;
+        bool           has_pending = false;
         if (epoch != 0) {
             for (int expert = 0; expert < n_experts; ++expert) {
                 if (plan.pending_priority_epoch[expert] != epoch) {
                     plan.pending_priority_epoch[expert] = 0;
+                } else {
+                    has_pending = true;
                 }
             }
         }
 
-        int32_t n_active = 0;
+        int32_t n_active       = 0;
+        int32_t n_initial_miss = 0;
         for (int32_t i = 0; i < n_experts; ++i) {
             const uint64_t active_route = active_routes[i];
             if (static_cast<int32_t>(active_route >> 32) == n_routes) {
                 continue;
             }
-            int32_t position = n_active;
-            while (position > 0 && active_routes[position - 1] > active_route) {
-                active_routes[position] = active_routes[position - 1];
-                position--;
+            const int32_t expert      = static_cast<uint32_t>(active_route);
+            active_routes[n_active++] = active_route;
+            n_initial_miss += plan.route_plan[expert].source < 0;
+        }
+
+        const bool needs_policy = n_initial_miss != 0 || has_pending;
+        if (needs_policy) {
+            for (int32_t i = 1; i < n_active; ++i) {
+                const uint64_t active_route = active_routes[i];
+                int32_t        position     = i;
+                while (position > 0 && active_routes[position - 1] > active_route) {
+                    active_routes[position] = active_routes[position - 1];
+                    position--;
+                }
+                active_routes[position] = active_route;
             }
-            active_routes[position] = active_route;
-            n_active++;
         }
         int32_t n_resident  = 0;
         int32_t n_miss      = 0;
         int32_t n_fill      = 0;
         int32_t n_evictions = 0;
-        for (int pass = ADMIT_ACTIVE_PRIORITY; pass < ADMIT_PASS_COUNT; ++pass) {
-            const bool    pending_pass = pass == ADMIT_PENDING_PRIORITY;
-            const bool    prompt_pass  = pass == ADMIT_ACTIVE_PROMPT;
-            const int32_t n_candidates = pending_pass ? n_experts : n_active;
-            for (int32_t i = 0; i < n_candidates; ++i) {
-                const int32_t expert = pending_pass ? i : static_cast<uint32_t>(active_routes[i]);
-                if ((pass == ADMIT_ACTIVE_PRIORITY && plan.route_priority[expert] == 0) ||
-                    (pending_pass && (epoch == 0 || plan.pending_priority_epoch[expert] != epoch ||
-                                      plan.route_priority[expert] != 0)) ||
-                    (prompt_pass && plan.route_priority[expert] != 0)) {
-                    continue;
-                }
-
-                const int32_t resident_slot = plan.expert_to_cache[expert];
-                if (resident_slot >= 0) {
-                    if (!pending_pass) {
-                        if (plan.expert_order != nullptr) {
-                            plan.expert_order[n_resident + n_fill] = expert;
-                        }
-                        n_resident++;
-                    }
-                    if (!prompt_pass && epoch != 0) {
-                        plan.protected_epoch[resident_slot] = epoch;
+        if (!needs_policy) {
+            n_resident = n_active;
+            if (epoch != 0) {
+                for (int32_t i = 0; i < n_active; ++i) {
+                    const int32_t expert = static_cast<uint32_t>(active_routes[i]);
+                    if (plan.route_plan[expert].priority != 0) {
+                        const int32_t slot                  = plan.expert_to_cache[expert];
+                        plan.protected_epoch[slot]          = epoch;
                         plan.pending_priority_epoch[expert] = 0;
                     }
-                    continue;
                 }
-                if (!pending_pass) {
-                    n_miss++;
-                }
-
-                int32_t victim = -1;
-                for (int32_t slot = 0; slot < n_cache; ++slot) {
-                    if (plan.cache_to_expert[slot] < 0) {
-                        victim = slot;
-                        break;
+            }
+        }
+        if (needs_policy) {
+            for (int pass = ADMIT_ACTIVE_PRIORITY; pass < ADMIT_PASS_COUNT; ++pass) {
+                const bool    pending_pass = pass == ADMIT_PENDING_PRIORITY;
+                const bool    prompt_pass  = pass == ADMIT_ACTIVE_PROMPT;
+                const int32_t n_candidates = pending_pass ? n_experts : n_active;
+                for (int32_t i = 0; i < n_candidates; ++i) {
+                    const int32_t expert = pending_pass ? i : static_cast<uint32_t>(active_routes[i]);
+                    if ((pass == ADMIT_ACTIVE_PRIORITY && plan.route_plan[expert].priority == 0) ||
+                        (pending_pass && (epoch == 0 || plan.pending_priority_epoch[expert] != epoch ||
+                                          plan.route_plan[expert].priority != 0)) ||
+                        (prompt_pass && plan.route_plan[expert].priority != 0)) {
+                        continue;
                     }
-                }
 
-                if (victim < 0 && !prompt_pass) {
-                    uint64_t oldest = UINT64_MAX;
+                    const int32_t resident_slot = plan.expert_to_cache[expert];
+                    if (resident_slot >= 0) {
+                        if (!pending_pass) {
+                            if (plan.expert_order != nullptr) {
+                                plan.expert_order[n_resident + n_fill] = expert;
+                            }
+                            n_resident++;
+                        }
+                        if (!prompt_pass && epoch != 0) {
+                            plan.protected_epoch[resident_slot] = epoch;
+                            plan.pending_priority_epoch[expert] = 0;
+                        }
+                        continue;
+                    }
+                    if (!pending_pass) {
+                        n_miss++;
+                    }
+
+                    int32_t victim = -1;
                     for (int32_t slot = 0; slot < n_cache; ++slot) {
-                        const int32_t resident      = plan.cache_to_expert[slot];
-                        const bool    protected_now = epoch != 0 && plan.protected_epoch[slot] == epoch;
-                        const bool    active_now    = plan.route_first[resident] != n_routes;
-                        if (!protected_now && !active_now && plan.last_used[slot] < oldest) {
-                            oldest = plan.last_used[slot];
+                        if (plan.cache_to_expert[slot] < 0) {
                             victim = slot;
+                            break;
                         }
                     }
-                }
-                if (victim < 0) {
-                    if (!prompt_pass && epoch != 0) {
-                        plan.pending_priority_epoch[expert] = epoch;
+
+                    if (victim < 0 && !prompt_pass) {
+                        uint64_t oldest = UINT64_MAX;
+                        for (int32_t slot = 0; slot < n_cache; ++slot) {
+                            const int32_t resident      = plan.cache_to_expert[slot];
+                            const bool    protected_now = epoch != 0 && plan.protected_epoch[slot] == epoch;
+                            const bool    active_now    = plan.route_plan[resident].first_route != n_routes;
+                            if (!protected_now && !active_now && plan.last_used[slot] < oldest) {
+                                oldest = plan.last_used[slot];
+                                victim = slot;
+                            }
+                        }
                     }
-                    continue;
-                }
+                    if (victim < 0) {
+                        if (!prompt_pass && epoch != 0) {
+                            plan.pending_priority_epoch[expert] = epoch;
+                        }
+                        continue;
+                    }
 
-                const int32_t evicted = plan.cache_to_expert[victim];
-                if (evicted >= 0) {
-                    plan.expert_to_cache[evicted] = -1;
-                    n_evictions++;
-                }
+                    const int32_t evicted = plan.cache_to_expert[victim];
+                    if (evicted >= 0) {
+                        plan.expert_to_cache[evicted] = -1;
+                        n_evictions++;
+                    }
 
-                plan.cache_to_expert[victim] = expert;
-                plan.protected_epoch[victim] = !prompt_pass && epoch != 0 ? epoch : 0;
-                if (!prompt_pass) {
-                    plan.pending_priority_epoch[expert] = 0;
+                    plan.cache_to_expert[victim] = expert;
+                    plan.protected_epoch[victim] = !prompt_pass && epoch != 0 ? epoch : 0;
+                    if (!prompt_pass) {
+                        plan.pending_priority_epoch[expert] = 0;
+                    }
+                    if (plan.expert_order != nullptr) {
+                        plan.expert_order[n_resident + n_fill] = expert;
+                    }
+                    plan.fill_expert[n_fill] = expert;
+                    plan.fill_slot[n_fill]   = victim;
+                    n_fill++;
                 }
-                if (plan.expert_order != nullptr) {
-                    plan.expert_order[n_resident + n_fill] = expert;
-                }
-                plan.fill_expert[n_fill] = expert;
-                plan.fill_slot[n_fill]   = victim;
-                n_fill++;
             }
         }
 
@@ -336,14 +421,43 @@ static __global__ void expert_plan_cache(ggml_cuda_expert_plan plan, int n_exper
         *plan.n_evictions    = n_evictions;
         *plan.n_streamed     = n_streamed;
         *plan.n_host_experts = n_host_experts;
+
+        if (plan.stats != nullptr) {
+            plan.stats->resolve_calls++;
+            plan.stats->update_touches += n_active;
+            plan.stats->resident_routes += n_routes - n_streamed;
+            plan.stats->streamed_routes += n_streamed;
+            plan.stats->cache_hits += n_resident;
+            plan.stats->cache_misses += n_miss;
+            plan.stats->evictions += n_evictions;
+            plan.stats->h2d_bytes += n_fill * plan.bytes_per_fill;
+            plan.stats->host_expert_bytes += n_host_experts * plan.bytes_per_fill;
+            *plan.copy_blocks_done = 0;
+            if (n_fill > 0) {
+                *plan.fill_start_ticks = wall_clock64();
+            }
+        }
+
+        bool pending_remains = false;
+        if (epoch != 0) {
+            for (int32_t expert = 0; expert < n_experts; ++expert) {
+                pending_remains |= plan.pending_priority_epoch[expert] == epoch;
+            }
+        }
+        *plan.policy_flags  = pending_remains ? POLICY_PENDING : 0;
+        *plan.resolve_active = 0;
     }
 
     __syncthreads();
     for (int32_t expert = threadIdx.x; expert < n_experts; expert += blockDim.x) {
-        const int32_t slot     = plan.expert_to_cache[expert];
-        const int32_t selector = slot >= 0 ? slot : -expert - 1;
-        for (int32_t compact = plan.route_bounds[expert]; compact < plan.route_bounds[expert + 1]; ++compact) {
-            plan.cache_ids[plan.route_ids[compact]] = selector;
+        if (plan.route_plan[expert].first_route != n_routes && plan.route_plan[expert].source < 0) {
+            const int32_t slot = plan.expert_to_cache[expert];
+            if (slot >= 0) {
+                plan.route_plan[expert].source = slot;
+                for (int32_t compact = plan.route_bounds[expert]; compact < plan.route_bounds[expert + 1]; ++compact) {
+                    plan.cache_ids[plan.route_ids[compact]] = slot;
+                }
+            }
         }
     }
 }
@@ -363,8 +477,9 @@ void ggml_cuda_launch_expert_plan(const int32_t *               ids,
     GGML_ASSERT(plan.ids_dst != nullptr);
     GGML_ASSERT(plan.expert_bounds != nullptr);
 
-    launch_expert_plan_routes(ids, plan.ids_src, plan.ids_dst, plan.expert_bounds, nullptr, nullptr, nullptr, n_experts,
-                              n_tokens, n_expert_used, nchannels_y, si1, sis1, write_inverse, stream);
+    launch_expert_plan_routes(ids, plan.ids_src, plan.ids_dst, plan.expert_bounds, nullptr, nullptr, nullptr, nullptr,
+                              nullptr, nullptr, nullptr, n_experts, n_tokens, n_expert_used, nchannels_y, si1, sis1,
+                              write_inverse, stream);
 
     if (plan.expert_order != nullptr) {
         ggml_cuda_launch_expert_cache_plan(ids, plan, n_experts, n_tokens, n_expert_used, n_cache, stream);
@@ -383,6 +498,7 @@ void ggml_cuda_launch_expert_cache_plan(const int32_t *               ids,
     GGML_ASSERT(n_cache > 0 && n_cache <= n_experts);
     GGML_ASSERT(plan.fill_expert != nullptr);
     GGML_ASSERT(plan.fill_slot != nullptr);
+    GGML_ASSERT(plan.expert_order != nullptr);
     GGML_ASSERT(plan.cache_ids != nullptr);
     GGML_ASSERT(plan.expert_to_cache != nullptr);
     GGML_ASSERT(plan.cache_to_expert != nullptr);
@@ -397,17 +513,19 @@ void ggml_cuda_launch_expert_cache_plan(const int32_t *               ids,
     GGML_ASSERT(plan.n_evictions != nullptr);
     GGML_ASSERT(plan.n_streamed != nullptr);
     GGML_ASSERT(plan.n_host_experts != nullptr);
+    GGML_ASSERT(plan.resolve_active != nullptr);
+    GGML_ASSERT(plan.policy_flags != nullptr);
 
     GGML_ASSERT(plan.route_ids != nullptr);
     GGML_ASSERT(plan.route_bounds != nullptr);
-    GGML_ASSERT(plan.route_first != nullptr);
-    GGML_ASSERT(plan.route_priority != nullptr);
+    GGML_ASSERT(plan.route_plan != nullptr);
 
     // Route grouping is the only stage that interprets router output.  The
     // serial cache policy and selector binding consume this saved plan.
-    launch_expert_plan_routes(ids, nullptr, plan.route_ids, plan.route_bounds, plan.route_first, plan.route_priority,
-                              plan.token_priority, n_experts, n_tokens, n_expert_used,
-                              /*nchannels_y=*/1, /*si1=*/n_expert_used, /*sis1=*/n_expert_used,
+    launch_expert_plan_routes(ids, nullptr, plan.route_ids, plan.route_bounds, plan.route_plan, plan.expert_to_cache,
+                              plan.cache_ids, plan.token_priority, plan.expert_order, plan.resolve_active,
+                              plan.policy_flags, n_experts, n_tokens, n_expert_used, /*nchannels_y=*/1,
+                              /*si1=*/n_expert_used, /*sis1=*/n_expert_used,
                               /*write_inverse=*/false, stream);
 
     const size_t shared_size = n_experts * sizeof(uint64_t);

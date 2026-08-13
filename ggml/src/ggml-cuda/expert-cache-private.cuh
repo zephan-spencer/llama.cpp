@@ -19,6 +19,8 @@ struct ggml_backend_cuda_expert_cache_state {
     uint32_t                     n_streamed;
     uint32_t                     n_host_experts;
     uint32_t                     copy_blocks_done;
+    uint32_t                     resolve_active;
+    uint32_t                     policy_flags;
 };
 
 struct ggml_backend_cuda_expert_cache_weight {
@@ -69,8 +71,8 @@ struct ggml_backend_cuda_expert_route_layout {
     uint64_t selectors_offset;
     uint64_t route_ids_offset;
     uint64_t route_bounds_offset;
-    uint64_t route_first_offset;
-    uint64_t route_priority_offset;
+    uint64_t route_plan_offset;
+    uint64_t active_experts_offset;
     uint64_t route_tile_bounds_offset;
     uint64_t size;
 };
@@ -122,9 +124,9 @@ static inline ggml_backend_cuda_expert_route_layout ggml_cuda_expert_cache_route
     layout.selectors_offset                      = 0;
     layout.route_ids_offset                      = n_routes * sizeof(int32_t);
     layout.route_bounds_offset                   = layout.route_ids_offset + n_routes * sizeof(int32_t);
-    layout.route_first_offset                    = layout.route_bounds_offset + (n_expert + 1) * sizeof(int32_t);
-    layout.route_priority_offset                 = layout.route_first_offset + n_expert * sizeof(int32_t);
-    layout.route_tile_bounds_offset              = layout.route_priority_offset + n_expert * sizeof(int32_t);
+    layout.route_plan_offset                     = layout.route_bounds_offset + (n_expert + 1) * sizeof(int32_t);
+    layout.active_experts_offset                 = layout.route_plan_offset + 3 * n_expert * sizeof(int32_t);
+    layout.route_tile_bounds_offset              = layout.active_experts_offset + n_expert * sizeof(int32_t);
     layout.size                                  = layout.route_tile_bounds_offset + (n_expert + 1) * sizeof(int32_t);
     return layout;
 }

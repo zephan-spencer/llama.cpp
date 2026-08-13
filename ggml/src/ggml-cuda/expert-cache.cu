@@ -205,38 +205,15 @@ static ggml_backend_cuda_expert_cache_desc * expert_cache_desc(const ggml_tensor
     return desc;
 }
 
-static __global__ void expert_cache_record_plan_kernel(uint8_t * state_data, expert_cache_params params) {
-    auto * header = reinterpret_cast<ggml_backend_cuda_expert_cache_state *>(state_data);
-    if (threadIdx.x != 0) {
-        return;
-    }
-
-    uint64_t bytes_per_fill = 0;
-    for (uint32_t weight = 0; weight < params.n_weights; ++weight) {
-        bytes_per_fill += params.weights[weight].size;
-    }
-
-    header->stats.resolve_calls++;
-    header->stats.update_touches += header->n_active;
-    header->stats.resident_routes += params.n_routes;
-    header->stats.resident_routes -= header->n_streamed;
-    header->stats.streamed_routes += header->n_streamed;
-    header->stats.cache_hits += header->n_resident;
-    header->stats.cache_misses += header->n_misses;
-    header->stats.evictions += header->n_evictions;
-    header->stats.h2d_bytes += header->n_fills * bytes_per_fill;
-    header->stats.host_expert_bytes += header->n_host_experts * bytes_per_fill;
-    header->copy_blocks_done = 0;
-    if (header->n_fills > 0) {
-        header->fill_start_ticks = wall_clock64();
-    }
-}
-
 static __global__ void expert_cache_copy_kernel(uint8_t * state_data, expert_cache_params params) {
     auto *         header      = reinterpret_cast<ggml_backend_cuda_expert_cache_state *>(state_data);
     const auto *   fill_expert = reinterpret_cast<const int32_t *>(state_data + params.fill_expert_offset);
     const auto *   fill_slot   = reinterpret_cast<const int32_t *>(state_data + params.fill_slot_offset);
     const uint32_t n_fills     = header->n_fills;
+
+    if (n_fills == 0) {
+        return;
+    }
 
     uint64_t vectors_per_fill = 0;
     for (uint32_t weight = 0; weight < params.n_weights; ++weight) {
@@ -380,9 +357,10 @@ void ggml_cuda_expert_cache(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
     plan.route_ids = reinterpret_cast<int32_t *>(static_cast<uint8_t *>(dst->data) + route_layout.route_ids_offset);
     plan.route_bounds =
         reinterpret_cast<int32_t *>(static_cast<uint8_t *>(dst->data) + route_layout.route_bounds_offset);
-    plan.route_first = reinterpret_cast<int32_t *>(static_cast<uint8_t *>(dst->data) + route_layout.route_first_offset);
-    plan.route_priority =
-        reinterpret_cast<int32_t *>(static_cast<uint8_t *>(dst->data) + route_layout.route_priority_offset);
+    plan.route_plan = reinterpret_cast<ggml_cuda_expert_route_plan *>(static_cast<uint8_t *>(dst->data) +
+                                                                      route_layout.route_plan_offset);
+    plan.expert_order =
+        reinterpret_cast<int32_t *>(static_cast<uint8_t *>(dst->data) + route_layout.active_experts_offset);
     plan.route_tile_bounds =
         reinterpret_cast<int32_t *>(static_cast<uint8_t *>(dst->data) + route_layout.route_tile_bounds_offset);
     plan.expert_to_cache        = reinterpret_cast<int32_t *>(state_data + params.expert_to_cache_offset);
@@ -400,14 +378,19 @@ void ggml_cuda_expert_cache(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
     plan.n_evictions            = &header->n_evictions;
     plan.n_streamed             = &header->n_streamed;
     plan.n_host_experts         = &header->n_host_experts;
+    plan.stats                  = &header->stats;
+    plan.fill_start_ticks       = &header->fill_start_ticks;
+    plan.copy_blocks_done       = &header->copy_blocks_done;
+    plan.resolve_active         = &header->resolve_active;
+    plan.policy_flags           = &header->policy_flags;
+    for (uint32_t i = 0; i < params.n_weights; ++i) {
+        plan.bytes_per_fill += params.weights[i].size;
+    }
 
     const int n_expert_used = dst->src[0]->ne[0];
     const int n_tokens      = ggml_nelements(dst->src[0]) / n_expert_used;
     ggml_cuda_launch_expert_cache_plan(static_cast<const int32_t *>(dst->src[0]->data), plan, desc->n_expert, n_tokens,
                                        n_expert_used, desc->n_cache, ctx.stream());
-    CUDA_CHECK(cudaGetLastError());
-
-    expert_cache_record_plan_kernel<<<1, 1, 0, ctx.stream()>>>(state_data, params);
     CUDA_CHECK(cudaGetLastError());
 
     expert_cache_copy_kernel<<<32, 256, 0, ctx.stream()>>>(state_data, params);

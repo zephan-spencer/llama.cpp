@@ -515,6 +515,7 @@ static __global__ void mul_mat_vec_q(
     uint32_t source_channel_x;
     uint32_t channel_y;
     uint32_t sample_dst;
+    bool     use_host_source = false;
 
     ggml_cuda_pdl_sync();
     channel_x  = ncols_dst == 1 && ids ? ids[channel_dst]                     : fastdiv(channel_dst, channel_ratio);
@@ -522,7 +523,8 @@ static __global__ void mul_mat_vec_q(
     if (ncols_dst == 1 && source_ids != nullptr) {
         const int source_id = source_ids[channel_dst];
         source_channel_x = source_id >= 0 ? source_id : -source_id - 1;
-        if (source_id < 0) {
+        use_host_source = source_id < 0;
+        if (use_host_source) {
             vx = source_host_ptr;
         }
     }
@@ -549,6 +551,9 @@ static __global__ void mul_mat_vec_q(
         use_bias      = fusion.x_bias    != nullptr;
         use_gate_bias = fusion.gate_bias != nullptr && use_gate;
         vgate         = fusion.gate;
+        if (use_gate && use_host_source) {
+            vgate = fusion.gate_host;
+        }
         x_bias        = (const float *) fusion.x_bias;
         gate_bias     = (const float *) fusion.gate_bias;
         active_glu    = fusion.glu_op;
@@ -601,9 +606,10 @@ static __global__ void mul_mat_vec_q(
     float tmp_gate[ncols_dst][rows_per_cuda_block] = {{0.0f}};
 
     const block_q8_1 * y = ((const block_q8_1 *) vy) + sample_y*stride_sample_y + channel_y*stride_channel_y;
-    const uint32_t source_stride = ncols_dst == 1 && source_ids != nullptr && source_ids[channel_dst] < 0 ?
-        source_host_stride : stride_channel_x;
+    const uint32_t source_stride = use_host_source ? source_host_stride : stride_channel_x;
+    const uint32_t gate_source_stride = use_host_source ? fusion.gate_host_stride : stride_channel_x;
     const int kbx_offset = sample_x*stride_sample_x + source_channel_x*source_stride + row0*stride_row_x;
+    const int gate_kbx_offset = sample_x*stride_sample_x + source_channel_x*gate_source_stride + row0*stride_row_x;
 
     for (int kbx = tid / (qi/vdr); kbx < blocks_per_row_x; kbx += blocks_per_iter) {
         const int kby = kbx * (qk/QK8_1); // y block index that aligns with kbx
@@ -620,7 +626,7 @@ static __global__ void mul_mat_vec_q(
                 if constexpr (has_fusion) {
                     if (use_gate) {
                         tmp_gate[j][i] += vec_dot_q_cuda(
-                            vgate, &y[j*stride_col_y + kby], kbx_offset + i*stride_row_x + kbx, kqs);
+                            vgate, &y[j*stride_col_y + kby], gate_kbx_offset + i*stride_row_x + kbx, kqs);
                     }
                 }
             }
@@ -1229,7 +1235,10 @@ void ggml_cuda_mul_mat_vec_q(
         }
         if (fusion->gate) {
             GGML_ASSERT(fusion->gate->type == src0->type && ggml_are_same_stride(fusion->gate, src0));
-            fusion_local.gate = fusion->gate->data;
+            fusion_local.gate             = fusion->gate->data;
+            fusion_local.gate_host        = fusion->gate_host;
+            fusion_local.gate_host_stride = fusion->gate_host_stride;
+            GGML_ASSERT(source == nullptr || fusion_local.gate_host != nullptr);
         }
         if (fusion->gate_bias) {
             GGML_ASSERT(fusion->gate_bias->type == GGML_TYPE_F32);
