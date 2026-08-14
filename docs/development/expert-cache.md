@@ -1,41 +1,45 @@
-# MoE expert cache specification
+# MoE expert cache
 
 ## Purpose
 
-The MoE expert cache keeps selected routed expert weight slices in GPU memory while complete routed weights remain in mapped host memory. Each routed layer owns an independent cache with a common capacity. The feature serves models whose complete expert weights exceed available GPU memory.
+The MoE expert cache keeps selected routed expert weight slices in GPU memory. Complete routed weights remain in mapped host memory. Each routed layer owns an independent cache with a common capacity. The feature serves models whose complete expert weights exceed available GPU memory.
 
-`--moe-cache-experts N` selects capacity `N`. Zero selects ordinary MoE execution. A positive value requires `n_expert_used <= N < n_expert`.
+`--moe-cache-experts N` selects capacity `N`. The cache is disabled by default. An explicit value requires `n_expert_used <= N < n_expert`.
 
 ## Supported configuration
 
 | Property | Current value |
 | --- | --- |
 | backend | ROCm/HIP |
-| accelerator count | one |
+| accelerator topology | one physical HIP device or one HIP tensor-parallel meta device |
 | model placement | every model layer on the accelerator |
-| split mode | none or single-device layer split |
-| routed weight location | accelerator-visible host buffer |
-| tested weight types | Q4_K, Q5_K, Q6_K |
-| matrix paths | MMQ and MMV |
+| split mode | none, single-device layer split, or tensor |
+| routed weight location | accelerator-visible host buffer, sharded by the meta backend in tensor mode |
+| automated matrix types | Q4_K and Q8_0 |
+| implemented matrix paths | MMQ and MMV/MMVQ |
 | projection layouts | gate and up, merged gate-up, down |
 
-Cache initialization rejects CPU layer placement, multiple accelerator devices, tensor splitting, meta devices, unsupported backends, incomplete routed tensors, tensor buffer overrides for routed weights, invalid capacities, and models without routed experts.
+Cache initialization rejects CPU layer placement, unsupported physical backends, incomplete routed tensors, tensor buffer overrides for routed weights, invalid capacities, and models without routed experts. Tensor mode requires every child of the meta device to expose the same expert-cache implementation.
 
-CUDA, Vulkan, and meta backends expose cache support after implementing the backend interface. A meta implementation owns rank-local child handles and coordinates route plans after tensor-parallel execution semantics are defined.
+The meta implementation owns one child handle per physical HIP device.
+
+In tensor mode, capacity is logical. A cache of `N` experts allocates `N` slots on every physical device, and each slot contains that device's existing tensor-parallel shard of the same expert. The aggregate VRAM across devices equals `N` complete experts. Routed weights are split once into device-local pinned host buffers by the ordinary tensor-placement code; expert weights do not move between GPUs.
+
+Router IDs, output priorities, epochs, cache state, selectors, and saved route plans are mirrored. Every physical device runs the same serial planner from identical inputs and therefore maintains the same expert-to-slot mapping. MMQ consumes the local weight shard, and the ordinary tensor-parallel all-reduce combines partial outputs.
 
 ## Ownership
 
-`llama_moe_expert_cache` owns feature configuration, per-layer source tensors, cache-slot tensors, state tensors, device buffers, backend handles, synchronization, memory accounting, logical-batch epochs, and aggregate statistics.
+`llama_moe_expert_cache` owns feature configuration, per-layer source tensors, cache-slot tensors, state tensors, device buffers, backend handles, synchronization, memory accounting, and logical-batch epochs.
 
-One backend handle owns one layer cache. The handle owns cache-state layout, source bindings, slot bindings, selector encoding, route-plan layout, replacement state, transfer scheduling, and backend statistics. Slot and plan bindings remain valid through handle destruction. Handle destruction clears every slot binding before releasing storage.
+One backend handle owns one layer cache. A meta handle composes one physical handle per tensor-parallel device. The handle owns cache-state layout, source bindings, slot bindings, selector encoding, route-plan layout, replacement state, and transfer scheduling. Slot and plan bindings remain valid through handle destruction. Handle destruction clears every slot binding before releasing storage.
 
 Source tensors and backend handles have context lifetime. Graph plan tensors have graph lifetime. Cache state and slot storage have context lifetime.
 
 ## Backend interface
 
-The backend registry exposes `ggml_backend_moe_cache_i` under `ggml_backend_moe_cache_get_interface`. ROCm supplies interface version 2.
+`ggml_backend_moe_cache_get_interface(device)` returns the cache implementation for a physical device or the meta adapter for a tensor-parallel device.
 
-`supports(device)` reports device capability. `get_state_size(n_expert, n_cache, n_weights)` returns required state bytes or zero for an invalid configuration.
+`get_source_buffer_type(device)` returns the device-visible host buffer type used for routed weights. For a meta device, this buffer contains one host shard per child device. `get_state_size(device, n_expert, n_cache, n_weights)` returns the required state bytes or zero for an invalid configuration.
 
 `create` receives one backend, one allocated state tensor, ordered source and slot arrays, expert count, capacity, and projection count. Creation validates buffer ownership, host visibility, tensor types, expert dimensions, slot dimensions, and expert strides. Failure returns a null handle and leaves tensor bindings unchanged.
 
@@ -45,8 +49,6 @@ The backend registry exposes `ggml_backend_moe_cache_i` under `ggml_backend_moe_
 - `execution`: the graph operation that resolves routes, updates state, fills slots, and owns saved route storage.
 
 The selector tensor carries a backend-private association with its handle. Matrix kernels use that association to obtain saved grouped routes. llama graph code treats both returned tensors as opaque backend products.
-
-`get_stats` reads one handle. `reset_stats` clears one handle. The llama owner aggregates every layer.
 
 ## Tensor contract
 
@@ -58,7 +60,7 @@ route = token * n_expert_used + expert_rank
 
 `token_priority` uses type I32 and shape `[n_tokens]`. Zero identifies prompt work. A nonzero value identifies output-priority work. `epoch` uses type I32 and shape `[1]`.
 
-A routed source tensor has one expert slice along dimension two and `ne[3] = 1`. Each expert occupies `nb[2]` bytes. Its buffer type equals the target device host buffer type.
+A routed source tensor has one expert slice along dimension two and `ne[3] = 1`. Each expert occupies `nb[2]` bytes. A physical-device source uses that device's host buffer type. A meta-device source uses a composite host buffer containing one shard for each child device.
 
 A slot tensor preserves source type, `ne[0]`, `ne[1]`, `nb[0]`, `nb[1]`, and `nb[2]`. It uses `ne[2] = N` and `ne[3] = 1`. Every projection in one layer uses the same expert-to-slot mapping.
 
@@ -154,18 +156,14 @@ Positive cache capacity requires a matching backend interface. Context construct
 
 Backend plan construction failure stops graph construction. A cache request with a failed requirement produces an initialization error.
 
-## Counters
+## Automated verification
 
-`resolve_calls` counts plans. `update_touches` counts unique requested experts. `resident_routes` and `streamed_routes` count routes by selector class. `cache_hits`, `cache_misses`, and `evictions` count expert planning results. `h2d_bytes` counts bytes copied into slots. `host_expert_bytes` counts unique streamed expert slices across cached projections. `fill_ticks` uses each handle's `wall_clock_hz`; aggregate display converts each handle to milliseconds before summation.
+The HIP planner cases cover overflow, first-use admission, priority-first admission, prompt residency stability, deferred priority, and epoch changes.
 
-Context performance reset clears every layer counter. Printed context values equal the sum of layer values.
+The numerical HIP cases compare these paths against all-resident tensors:
 
-## Acceptance
+- Q8_0 single-token fused MMVQ source selection.
+- Q4_K 16-token MMQ source selection.
+- Q4_K 128-token cached MMQ execution across initial fill and graph reuse.
 
-RDNA4 ROCm correctness acceptance covers Q4_K, Q5_K, and Q6_K through MMQ and MMV. Tests exercise resident routes, streamed routes, repeated plans, duplicate routes, complete expert activation, active-route retention, deferred output-priority admission, epoch protection, epoch release, equal-timestamp victim selection, and route-tile launch bounds. Cached matrix results use fully resident routed matrices as the numerical reference.
-
-Interface tests obtain version 2 from the backend registry, reject invalid dimensions and malformed creation, construct a handle with backend-owned buffers, build selector and execution tensors, destroy the handle, and verify slot-binding cleanup.
-
-A configured HIP build includes server, benchmark, batched benchmark, and perplexity targets. `test-moe-expert-plan` and `test-batch-alloc` complete successfully.
-
-Performance acceptance uses synthetic 8196-token inputs for isolated llama-bench PP and TG after a complete warmup. Mixed server measurement uses the WikiText prompt with four established TG streams and one PP stream. Measurements cover cache capacities 32, 64, 128, and 192, plus ordinary all-resident execution, and report throughput, fills, copied bytes, resident routes, and streamed routes. N192 PP targets at least 95 percent of all-resident PP throughput. Cached TG targets at least 95 percent of the checkpoint result.
+The automated cache tests use one HIP device. `test-batch-alloc` covers output-priority preservation across simple, equal, and sequence-based ubatch splitting.

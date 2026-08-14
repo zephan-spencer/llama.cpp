@@ -456,7 +456,7 @@ static void print_usage(int /* argc */, char ** argv) {
     printf("  --poll <0...100>                                  (default: %s)\n", join(cmd_params_defaults.poll, ",").c_str());
     printf("  -ngl, --n-gpu-layers <n>                          (default: %s)\n", join(cmd_params_defaults.n_gpu_layers, ",").c_str());
     printf("  -ncmoe, --n-cpu-moe <n>                           (default: %s)\n", join(cmd_params_defaults.n_cpu_moe, ",").c_str());
-    printf("  --moe-cache-experts <n>                           keep routed expert weights in host memory and cache n experts per MoE layer on one GPU; n must be smaller than the model's expert count (default: %s)\n", join(cmd_params_defaults.n_moe_cache_experts, ",").c_str());
+    printf("  --moe-cache-experts <n>                           keep routed expert weights in host memory and cache n logical experts per MoE layer; n must be positive and smaller than the model's expert count; disabled by default\n");
     printf("  -sm, --split-mode <none|layer|row|tensor>         (default: %s)\n", join(transform_to_str(cmd_params_defaults.split_mode, split_mode_str), ",").c_str());
     printf("  -mg, --main-gpu <i>                               (default: %s)\n", join(cmd_params_defaults.main_gpu, ",").c_str());
     printf("  -nkvo, --no-kv-offload <0|1>                      (default: %s)\n", join(cmd_params_defaults.no_kv_offload, ",").c_str());

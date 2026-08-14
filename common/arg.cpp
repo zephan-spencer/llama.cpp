@@ -2509,8 +2509,8 @@ common_params_context common_params_parser_init(common_params & params,
                        })
                 .set_env("LLAMA_ARG_N_CPU_MOE"));
     add_opt(common_arg({ "--moe-cache-experts" }, "N",
-                       "keep routed expert weights in host memory and cache N experts per MoE layer on one GPU; "
-                       "N must be positive and smaller than the model's expert count; omit this option to disable",
+                       "keep routed expert weights in host memory and cache N logical experts per MoE layer; "
+                       "N must be positive and smaller than the model's expert count; disabled by default",
                        [](common_params & params, int value) {
                            if (value <= 0) {
                                throw std::invalid_argument("must be positive; omit --moe-cache-experts to disable");
