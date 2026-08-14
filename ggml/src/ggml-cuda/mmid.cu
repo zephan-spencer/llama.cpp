@@ -225,28 +225,19 @@ static __global__ void expert_plan_cache(ggml_cuda_expert_plan plan, int n_exper
                 }
             }
 
-            *plan.n_active       = n_active;
-            *plan.n_resident     = n_active;
-            *plan.n_miss         = 0;
             *plan.n_fill         = 0;
-            *plan.n_evictions    = 0;
-            *plan.n_streamed     = 0;
-            *plan.n_host_experts = 0;
             *plan.resolve_active = 0;
-
-            if (plan.stats != nullptr) {
-                plan.stats->resolve_calls++;
-                plan.stats->update_touches += n_active;
-                plan.stats->resident_routes += n_routes;
-                plan.stats->cache_hits += n_active;
-                *plan.copy_blocks_done = 0;
-            }
         }
         return;
     }
 
-    for (int expert = threadIdx.x; expert < n_experts; expert += blockDim.x) {
-        active_routes[expert] =
+    const uint32_t policy_flags = *plan.policy_flags;
+    const int32_t  n_active     = *plan.resolve_active;
+
+    // Route grouping owns active-expert discovery; the serial policy consumes that saved list.
+    for (int32_t i = threadIdx.x; i < n_active; i += blockDim.x) {
+        const int32_t expert = plan.expert_order[i];
+        active_routes[i] =
             (static_cast<uint64_t>(plan.route_plan[expert].first_route) << 32) | static_cast<uint32_t>(expert);
     }
     __syncthreads();
@@ -254,9 +245,9 @@ static __global__ void expert_plan_cache(ggml_cuda_expert_plan plan, int n_exper
     if (threadIdx.x == 0) {
         const uint64_t epoch       = plan.epoch ? static_cast<uint64_t>(*plan.epoch) : 0;
         bool           has_pending = false;
-        if (epoch != 0) {
+        if ((policy_flags & POLICY_PENDING) != 0) {
             for (int expert = 0; expert < n_experts; ++expert) {
-                if (plan.pending_priority_epoch[expert] != epoch) {
+                if (epoch == 0 || plan.pending_priority_epoch[expert] != epoch) {
                     plan.pending_priority_epoch[expert] = 0;
                 } else {
                     has_pending = true;
@@ -264,19 +255,7 @@ static __global__ void expert_plan_cache(ggml_cuda_expert_plan plan, int n_exper
             }
         }
 
-        int32_t n_active       = 0;
-        int32_t n_initial_miss = 0;
-        for (int32_t i = 0; i < n_experts; ++i) {
-            const uint64_t active_route = active_routes[i];
-            if (static_cast<int32_t>(active_route >> 32) == n_routes) {
-                continue;
-            }
-            const int32_t expert      = static_cast<uint32_t>(active_route);
-            active_routes[n_active++] = active_route;
-            n_initial_miss += plan.route_plan[expert].source < 0;
-        }
-
-        const bool needs_policy = n_initial_miss != 0 || has_pending;
+        const bool needs_policy = (policy_flags & POLICY_MISS) != 0 || has_pending;
         if (needs_policy) {
             for (int32_t i = 1; i < n_active; ++i) {
                 const uint64_t active_route = active_routes[i];
@@ -289,9 +268,8 @@ static __global__ void expert_plan_cache(ggml_cuda_expert_plan plan, int n_exper
             }
         }
         int32_t n_resident  = 0;
-        int32_t n_miss      = 0;
         int32_t n_fill      = 0;
-        int32_t n_evictions = 0;
+        bool    may_have_pending = has_pending;
         if (!needs_policy) {
             n_resident = n_active;
             if (epoch != 0) {
@@ -333,21 +311,14 @@ static __global__ void expert_plan_cache(ggml_cuda_expert_plan plan, int n_exper
                         }
                         continue;
                     }
-                    if (!pending_pass) {
-                        n_miss++;
-                    }
-
                     int32_t victim = -1;
+                    uint64_t oldest = UINT64_MAX;
                     for (int32_t slot = 0; slot < n_cache; ++slot) {
                         if (plan.cache_to_expert[slot] < 0) {
                             victim = slot;
                             break;
                         }
-                    }
-
-                    if (victim < 0 && !prompt_pass) {
-                        uint64_t oldest = UINT64_MAX;
-                        for (int32_t slot = 0; slot < n_cache; ++slot) {
+                        if (!prompt_pass) {
                             const int32_t resident      = plan.cache_to_expert[slot];
                             const bool    protected_now = epoch != 0 && plan.protected_epoch[slot] == epoch;
                             const bool    active_now    = plan.route_plan[resident].first_route != n_routes;
@@ -360,6 +331,7 @@ static __global__ void expert_plan_cache(ggml_cuda_expert_plan plan, int n_exper
                     if (victim < 0) {
                         if (!prompt_pass && epoch != 0) {
                             plan.pending_priority_epoch[expert] = epoch;
+                            may_have_pending                    = true;
                         }
                         continue;
                     }
@@ -367,7 +339,6 @@ static __global__ void expert_plan_cache(ggml_cuda_expert_plan plan, int n_exper
                     const int32_t evicted = plan.cache_to_expert[victim];
                     if (evicted >= 0) {
                         plan.expert_to_cache[evicted] = -1;
-                        n_evictions++;
                     }
 
                     plan.cache_to_expert[victim] = expert;
@@ -404,42 +375,10 @@ static __global__ void expert_plan_cache(ggml_cuda_expert_plan plan, int n_exper
             plan.last_used[plan.fill_slot[i]] = use_clock;
         }
 
-        int32_t n_streamed     = 0;
-        int32_t n_host_experts = 0;
-        for (int32_t i = 0; i < n_active; ++i) {
-            const int32_t expert = static_cast<uint32_t>(active_routes[i]);
-            if (plan.expert_to_cache[expert] < 0) {
-                n_streamed += plan.route_bounds[expert + 1] - plan.route_bounds[expert];
-                n_host_experts++;
-            }
-        }
-
-        *plan.n_active       = n_active;
-        *plan.n_resident     = n_resident;
-        *plan.n_miss         = n_miss;
         *plan.n_fill         = n_fill;
-        *plan.n_evictions    = n_evictions;
-        *plan.n_streamed     = n_streamed;
-        *plan.n_host_experts = n_host_experts;
-
-        if (plan.stats != nullptr) {
-            plan.stats->resolve_calls++;
-            plan.stats->update_touches += n_active;
-            plan.stats->resident_routes += n_routes - n_streamed;
-            plan.stats->streamed_routes += n_streamed;
-            plan.stats->cache_hits += n_resident;
-            plan.stats->cache_misses += n_miss;
-            plan.stats->evictions += n_evictions;
-            plan.stats->h2d_bytes += n_fill * plan.bytes_per_fill;
-            plan.stats->host_expert_bytes += n_host_experts * plan.bytes_per_fill;
-            *plan.copy_blocks_done = 0;
-            if (n_fill > 0) {
-                *plan.fill_start_ticks = wall_clock64();
-            }
-        }
 
         bool pending_remains = false;
-        if (epoch != 0) {
+        if (epoch != 0 && may_have_pending) {
             for (int32_t expert = 0; expert < n_experts; ++expert) {
                 pending_remains |= plan.pending_priority_epoch[expert] == epoch;
             }
@@ -449,7 +388,8 @@ static __global__ void expert_plan_cache(ggml_cuda_expert_plan plan, int n_exper
     }
 
     __syncthreads();
-    for (int32_t expert = threadIdx.x; expert < n_experts; expert += blockDim.x) {
+    for (int32_t i = threadIdx.x; i < n_active; i += blockDim.x) {
+        const int32_t expert = static_cast<uint32_t>(active_routes[i]);
         if (plan.route_plan[expert].first_route != n_routes && plan.route_plan[expert].source < 0) {
             const int32_t slot = plan.expert_to_cache[expert];
             if (slot >= 0) {
@@ -506,13 +446,7 @@ void ggml_cuda_launch_expert_cache_plan(const int32_t *               ids,
     GGML_ASSERT(plan.protected_epoch != nullptr);
     GGML_ASSERT(plan.pending_priority_epoch != nullptr);
     GGML_ASSERT(plan.use_clock != nullptr);
-    GGML_ASSERT(plan.n_active != nullptr);
-    GGML_ASSERT(plan.n_resident != nullptr);
-    GGML_ASSERT(plan.n_miss != nullptr);
     GGML_ASSERT(plan.n_fill != nullptr);
-    GGML_ASSERT(plan.n_evictions != nullptr);
-    GGML_ASSERT(plan.n_streamed != nullptr);
-    GGML_ASSERT(plan.n_host_experts != nullptr);
     GGML_ASSERT(plan.resolve_active != nullptr);
     GGML_ASSERT(plan.policy_flags != nullptr);
 

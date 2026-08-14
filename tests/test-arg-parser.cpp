@@ -171,8 +171,10 @@ static void test(void) {
 
     conflict_params = {};
     argv            = { "binary_name", "-m", "model_file.gguf", "--moe-cache-experts", "64", "--split-mode", "tensor" };
-    assert(false ==
+    assert(true ==
            common_params_parse(argv.size(), list_str_to_char(argv).data(), conflict_params, LLAMA_EXAMPLE_COMMON));
+    assert(conflict_params.n_moe_cache_experts == 64);
+    assert(conflict_params.split_mode == LLAMA_SPLIT_MODE_TENSOR);
 
     printf("test-arg-parser: test valid usage\n\n");
 

@@ -84,13 +84,8 @@ struct plan_result {
     std::vector<uint64_t> last_used;
     std::vector<uint64_t> protected_epoch;
     uint64_t              use_clock      = 0;
-    uint32_t              n_active       = 0;
     uint32_t              n_resident     = 0;
-    uint32_t              n_miss         = 0;
     uint32_t              n_fill         = 0;
-    uint32_t              n_evictions    = 0;
-    uint32_t              n_streamed     = 0;
-    uint32_t              n_host_experts = 0;
 };
 
 static std::vector<int32_t> make_expert_to_cache(const test_case & test) {
@@ -161,8 +156,6 @@ static plan_result make_reference(const test_case & test) {
         }
     }
 
-    result.n_active = unique.size();
-
     for (int pass = 0; pass < 2; ++pass) {
         for (int32_t expert : unique) {
             if ((pass == 0) != priority_requested[expert]) {
@@ -176,8 +169,6 @@ static plan_result make_reference(const test_case & test) {
                 }
                 continue;
             }
-            result.n_miss++;
-
             int32_t victim = -1;
             for (int32_t slot = 0; slot < test.n_cache; ++slot) {
                 if (result.cache_to_expert[slot] < 0) {
@@ -204,7 +195,6 @@ static plan_result make_reference(const test_case & test) {
             const int32_t evicted = result.cache_to_expert[victim];
             if (evicted >= 0) {
                 result.expert_to_cache[evicted] = -1;
-                result.n_evictions++;
             }
             result.cache_to_expert[victim]                         = expert;
             result.protected_epoch[victim]                         = pass == 0 ? test.epoch : 0;
@@ -231,17 +221,11 @@ static plan_result make_reference(const test_case & test) {
             result.last_used[slot] = result.use_clock;
         }
     }
-    std::vector<bool> streamed_experts(test.n_expert, false);
     for (int32_t i = 0; i < n_ids; ++i) {
         const int32_t slot  = result.expert_to_cache[test.ids[i]];
         result.cache_ids[i] = slot >= 0 ? slot : -test.ids[i] - 1;
         if (slot >= 0) {
             result.route_source[test.ids[i]] = slot;
-        }
-        result.n_streamed += slot < 0;
-        if (slot < 0 && !streamed_experts[test.ids[i]]) {
-            streamed_experts[test.ids[i]] = true;
-            result.n_host_experts++;
         }
     }
     return result;
@@ -293,13 +277,7 @@ static void run_case(const test_case & test, hipStream_t stream) {
     device_buffer<uint64_t>                    use_clock(1);
     device_buffer<int32_t>                     token_priority(test.n_tokens);
     device_buffer<int32_t>                     epoch(1);
-    device_buffer<uint32_t>                    n_active(1);
-    device_buffer<uint32_t>                    n_resident(1);
-    device_buffer<uint32_t>                    n_miss(1);
     device_buffer<uint32_t>                    n_fill(1);
-    device_buffer<uint32_t>                    n_evictions(1);
-    device_buffer<uint32_t>                    n_streamed(1);
-    device_buffer<uint32_t>                    n_host_experts(1);
     device_buffer<uint32_t>                    resolve_active(1);
     device_buffer<uint32_t>                    policy_flags(1);
 
@@ -334,13 +312,7 @@ static void run_case(const test_case & test, hipStream_t stream) {
     plan.use_clock              = use_clock.ptr;
     plan.token_priority         = token_priority.ptr;
     plan.epoch                  = epoch.ptr;
-    plan.n_active               = n_active.ptr;
-    plan.n_resident             = n_resident.ptr;
-    plan.n_miss                 = n_miss.ptr;
     plan.n_fill                 = n_fill.ptr;
-    plan.n_evictions            = n_evictions.ptr;
-    plan.n_streamed             = n_streamed.ptr;
-    plan.n_host_experts         = n_host_experts.ptr;
     plan.resolve_active         = resolve_active.ptr;
     plan.policy_flags           = policy_flags.ptr;
 
@@ -391,14 +363,7 @@ static void run_case(const test_case & test, hipStream_t stream) {
     expect_equal(test.name, "last_used", last_used.get(), expected.last_used, test.n_cache);
     expect_equal(test.name, "protected_epoch", protected_epoch.get(), expected.protected_epoch, test.n_cache);
     expect_equal(test.name, "use_clock", use_clock.get(), std::vector<uint64_t>{ expected.use_clock }, 1);
-    expect_equal(test.name, "n_active", n_active.get(), std::vector<uint32_t>{ expected.n_active }, 1);
-    expect_equal(test.name, "n_resident", n_resident.get(), std::vector<uint32_t>{ expected.n_resident }, 1);
-    expect_equal(test.name, "n_miss", n_miss.get(), std::vector<uint32_t>{ expected.n_miss }, 1);
     expect_equal(test.name, "n_fill", n_fill.get(), std::vector<uint32_t>{ expected.n_fill }, 1);
-    expect_equal(test.name, "n_evictions", n_evictions.get(), std::vector<uint32_t>{ expected.n_evictions }, 1);
-    expect_equal(test.name, "n_streamed", n_streamed.get(), std::vector<uint32_t>{ expected.n_streamed }, 1);
-    expect_equal(test.name, "n_host_experts", n_host_experts.get(), std::vector<uint32_t>{ expected.n_host_experts },
-                 1);
 
     std::printf("%s: OK\n", test.name.c_str());
 }
@@ -424,13 +389,7 @@ static void run_deferred_priority_case(hipStream_t stream) {
     device_buffer<uint64_t>                    pending_priority_epoch(n_expert);
     device_buffer<uint64_t>                    use_clock(1);
     device_buffer<int32_t>                     epoch(1);
-    device_buffer<uint32_t>                    n_active(1);
-    device_buffer<uint32_t>                    n_resident(1);
-    device_buffer<uint32_t>                    n_miss(1);
     device_buffer<uint32_t>                    n_fill(1);
-    device_buffer<uint32_t>                    n_evictions(1);
-    device_buffer<uint32_t>                    n_streamed(1);
-    device_buffer<uint32_t>                    n_host_experts(1);
     device_buffer<uint32_t>                    resolve_active(1);
     device_buffer<uint32_t>                    policy_flags(1);
 
@@ -450,13 +409,7 @@ static void run_deferred_priority_case(hipStream_t stream) {
     plan.use_clock              = use_clock.ptr;
     plan.token_priority         = priority.ptr;
     plan.epoch                  = epoch.ptr;
-    plan.n_active               = n_active.ptr;
-    plan.n_resident             = n_resident.ptr;
-    plan.n_miss                 = n_miss.ptr;
     plan.n_fill                 = n_fill.ptr;
-    plan.n_evictions            = n_evictions.ptr;
-    plan.n_streamed             = n_streamed.ptr;
-    plan.n_host_experts         = n_host_experts.ptr;
     plan.resolve_active         = resolve_active.ptr;
     plan.policy_flags           = policy_flags.ptr;
 
@@ -498,7 +451,6 @@ static void run_deferred_priority_case(hipStream_t stream) {
     expect_equal("deferred-second", "protected_epoch", protected_epoch.get(), { 11, 0 }, 2);
     expect_equal("deferred-second", "last_used", last_used.get(), { 2, 2 }, 2);
     expect_equal("deferred-second", "use_clock", use_clock.get(), { 2 }, 1);
-    expect_equal("deferred-second", "n_miss", n_miss.get(), { 0 }, 1);
     expect_equal("deferred-second", "n_fill", n_fill.get(), { 1 }, 1);
 
     reset();
@@ -750,7 +702,6 @@ static void run_backend_cached_source_case(ggml_backend_t backend, ggml_type typ
         };
         ggml_backend_cuda_expert_cache_desc cache_desc = {};
         cache_desc.magic                               = GGML_CUDA_EXPERT_CACHE_MAGIC;
-        cache_desc.version                             = GGML_CUDA_EXPERT_CACHE_VERSION;
         cache_desc.n_expert                            = n_expert;
         cache_desc.n_cache                             = n_cache;
         cache_desc.n_weights                           = 1;

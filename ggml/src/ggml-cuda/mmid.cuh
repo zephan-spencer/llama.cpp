@@ -2,8 +2,6 @@
 
 #include <cstdint>
 
-struct ggml_backend_moe_cache_stats;
-
 struct ggml_cuda_expert_route_plan {
     int32_t first_route;
     int32_t priority;
@@ -50,20 +48,10 @@ struct ggml_cuda_expert_plan {
     const int32_t * token_priority;
     const int32_t * epoch;
 
-    uint32_t * n_active;
-    uint32_t * n_resident;
-    uint32_t * n_miss;
     uint32_t * n_fill;
-    uint32_t * n_evictions;
-    uint32_t * n_streamed;
-    uint32_t * n_host_experts;
 
-    ggml_backend_moe_cache_stats * stats;
-    uint64_t *                     fill_start_ticks;
-    uint32_t *                     copy_blocks_done;
     uint32_t *                     resolve_active;
     uint32_t *                     policy_flags;
-    uint64_t                       bytes_per_fill;
 };
 
 void ggml_cuda_launch_expert_plan(const int32_t *               ids,

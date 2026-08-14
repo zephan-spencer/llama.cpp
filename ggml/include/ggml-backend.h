@@ -223,30 +223,14 @@ extern "C" {
     };
     typedef struct ggml_backend_feature * (*ggml_backend_get_features_t)(ggml_backend_reg_t reg);
 
-    // Versioned MoE expert-cache backend extension.
-    #define GGML_BACKEND_MOE_CACHE_INTERFACE_VERSION 2
     #define GGML_BACKEND_MOE_CACHE_MAX_WEIGHTS 4
-    struct ggml_backend_moe_cache_stats {
-        uint64_t resolve_calls;
-        uint64_t update_touches;
-        uint64_t resident_routes;
-        uint64_t streamed_routes;
-        uint64_t cache_hits;
-        uint64_t cache_misses;
-        uint64_t evictions;
-        uint64_t h2d_bytes;
-        uint64_t host_expert_bytes;
-        uint64_t fill_ticks;
-        uint64_t wall_clock_hz;
-    };
     struct ggml_backend_moe_cache_plan {
         struct ggml_tensor * selectors;
         struct ggml_tensor * execution;
     };
     struct ggml_backend_moe_cache_i {
-        uint32_t version;
-        bool (*supports)(ggml_backend_dev_t device);
-        size_t (*get_state_size)(uint32_t n_expert, uint32_t n_cache, uint32_t n_weights);
+        ggml_backend_buffer_type_t (*get_source_buffer_type)(ggml_backend_dev_t device);
+        size_t (*get_state_size)(ggml_backend_dev_t device, uint32_t n_expert, uint32_t n_cache, uint32_t n_weights);
         ggml_backend_moe_cache_t (*create)(
             ggml_backend_t backend,
             struct ggml_tensor * state,
@@ -262,10 +246,10 @@ extern "C" {
             struct ggml_tensor * logical_ids,
             struct ggml_tensor * token_priority,
             struct ggml_tensor * epoch);
-        void (*get_stats)(ggml_backend_moe_cache_t cache, struct ggml_backend_moe_cache_stats * stats);
-        void (*reset_stats)(ggml_backend_moe_cache_t cache);
     };
     typedef const struct ggml_backend_moe_cache_i * (*ggml_backend_moe_cache_get_interface_t)(void);
+
+    GGML_API const struct ggml_backend_moe_cache_i * ggml_backend_moe_cache_get_interface(ggml_backend_dev_t device);
 
     //
     // Backend registry

@@ -3,22 +3,12 @@
 #include "ggml-backend.h"
 
 #define GGML_CUDA_EXPERT_CACHE_MAGIC   0x4558504341434845ULL
-#define GGML_CUDA_EXPERT_CACHE_VERSION 7
 #define GGML_CUDA_EXPERT_SOURCE_MAGIC  0x4558505352430001ULL
 #define GGML_CUDA_EXPERT_PLAN_MAGIC    0x455850504C414E01ULL
 
 struct ggml_backend_cuda_expert_cache_state {
     uint64_t                     use_clock;
-    ggml_backend_moe_cache_stats stats;
-    uint64_t                     fill_start_ticks;
-    uint32_t                     n_active;
-    uint32_t                     n_resident;
-    uint32_t                     n_misses;
     uint32_t                     n_fills;
-    uint32_t                     n_evictions;
-    uint32_t                     n_streamed;
-    uint32_t                     n_host_experts;
-    uint32_t                     copy_blocks_done;
     uint32_t                     resolve_active;
     uint32_t                     policy_flags;
 };
@@ -40,7 +30,6 @@ struct ggml_backend_cuda_expert_source {
 
 struct ggml_backend_cuda_expert_cache_desc {
     uint64_t                              magic;
-    uint32_t                              version;
     uint32_t                              n_expert;
     uint32_t                              n_cache;
     uint32_t                              n_weights;
@@ -52,7 +41,6 @@ struct ggml_backend_cuda_expert_cache_desc {
     uint64_t                              fill_expert_offset;
     uint64_t                              fill_slot_offset;
     uint64_t                              state_size;
-    uint64_t                              wall_clock_hz;
     ggml_backend_cuda_expert_cache_weight weights[GGML_BACKEND_MOE_CACHE_MAX_WEIGHTS];
 };
 
@@ -84,7 +72,6 @@ struct ggml_backend_cuda_expert_plan_binding {
 
 struct ggml_backend_moe_cache {
     ggml_backend_cuda_expert_cache_desc   desc;
-    ggml_backend_t                        backend;
     ggml_tensor *                         state;
     ggml_tensor *                         slots[GGML_BACKEND_MOE_CACHE_MAX_WEIGHTS];
     ggml_backend_cuda_expert_source       source_bindings[GGML_BACKEND_MOE_CACHE_MAX_WEIGHTS];

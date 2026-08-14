@@ -6,7 +6,6 @@
 #include "llama-model.h"
 
 #include <algorithm>
-#include <cinttypes>
 #include <cstring>
 #include <stdexcept>
 #include <unordered_map>
@@ -43,10 +42,6 @@ void llama_moe_cache_validate_model(const llama_model & model, uint32_t n_cache)
 
     if (model.n_gpu_layers() != model.hparams.n_layer_all + 1) {
         throw std::runtime_error("MoE expert cache: every model layer requires GPU placement");
-    }
-
-    if (model.split_mode() == LLAMA_SPLIT_MODE_TENSOR) {
-        throw std::runtime_error("MoE expert cache: tensor parallelism requires a meta-device cache implementation");
     }
 }
 
@@ -116,13 +111,7 @@ struct llama_moe_expert_cache::impl {
     }
 
     static const ggml_backend_moe_cache_i * api_for(ggml_backend_dev_t device) {
-        ggml_backend_reg_t registry      = ggml_backend_dev_backend_reg(device);
-        auto               get_interface = reinterpret_cast<ggml_backend_moe_cache_get_interface_t>(
-            ggml_backend_reg_get_proc_address(registry, "ggml_backend_moe_cache_get_interface"));
-        const ggml_backend_moe_cache_i * api = get_interface ? get_interface() : nullptr;
-        return api != nullptr && api->version == GGML_BACKEND_MOE_CACHE_INTERFACE_VERSION && api->supports(device) ?
-                   api :
-                   nullptr;
+        return ggml_backend_moe_cache_get_interface(device);
     }
 
     group * create(int il, const std::vector<ggml_tensor *> & source_tensors) {
@@ -137,8 +126,10 @@ struct llama_moe_expert_cache::impl {
 
         ggml_backend_t     backend      = backend_for_layer(il);
         ggml_backend_dev_t layer_device = backend ? ggml_backend_get_device(backend) : nullptr;
+        const enum ggml_backend_dev_type device_type =
+            layer_device != nullptr ? ggml_backend_dev_type(layer_device) : GGML_BACKEND_DEVICE_TYPE_CPU;
         if (backend == nullptr || layer_device == nullptr ||
-            ggml_backend_dev_type(layer_device) != GGML_BACKEND_DEVICE_TYPE_GPU) {
+            (device_type != GGML_BACKEND_DEVICE_TYPE_GPU && device_type != GGML_BACKEND_DEVICE_TYPE_META)) {
             throw std::runtime_error("MoE expert cache: every routed layer requires GPU placement");
         }
 
@@ -171,7 +162,7 @@ struct llama_moe_expert_cache::impl {
         result->buft     = ggml_backend_get_default_buffer_type(backend);
         result->api      = api;
 
-        const size_t state_size = api->get_state_size(n_expert, n_cache, source_tensors.size());
+        const size_t state_size = api->get_state_size(layer_device, n_expert, n_cache, source_tensors.size());
         if (state_size == 0) {
             throw std::runtime_error("MoE expert cache: backend rejected cache configuration");
         }
@@ -188,7 +179,14 @@ struct llama_moe_expert_cache::impl {
             for (int dimension = 0; dimension < GGML_MAX_DIMS; ++dimension) {
                 slots->nb[dimension] = tensor->nb[dimension];
             }
+            if (model.split_mode() == LLAMA_SPLIT_MODE_TENSOR) {
+                // Meta tensor placement is name-driven.  Reuse the routed
+                // weight name so cache slots receive exactly the same shard
+                // geometry as their source tensor.
+                ggml_set_name(slots, tensor->name);
+            } else {
             ggml_format_name(slots, "%s#moe_cache", tensor->name);
+            }
             result->weights.push_back({ tensor, slots });
         }
 
@@ -332,47 +330,6 @@ void llama_moe_expert_cache::print_info() {
     LLAMA_LOG_INFO(
         "MoE expert cache: host expert weights = %.2f MiB, GPU cache = %.2f MiB, experts = %u / %u, layers = %zu\n",
         host / 1048576.0, total / 1048576.0, pimpl->n_cache, pimpl->model.hparams.n_expert, pimpl->groups.size());
-}
-
-void llama_moe_expert_cache::print_stats() const {
-    ggml_backend_moe_cache_stats total   = {};
-    double                       fill_ms = 0.0;
-
-    for (const auto & group : pimpl->groups) {
-        if (group->handle == nullptr) {
-            continue;
-        }
-
-        ggml_backend_moe_cache_stats stats = {};
-        group->api->get_stats(group->handle, &stats);
-        total.resolve_calls += stats.resolve_calls;
-        total.update_touches += stats.update_touches;
-        total.resident_routes += stats.resident_routes;
-        total.streamed_routes += stats.streamed_routes;
-        total.cache_hits += stats.cache_hits;
-        total.cache_misses += stats.cache_misses;
-        total.evictions += stats.evictions;
-        total.h2d_bytes += stats.h2d_bytes;
-        total.host_expert_bytes += stats.host_expert_bytes;
-        if (stats.wall_clock_hz != 0) {
-            fill_ms += 1000.0 * stats.fill_ticks / stats.wall_clock_hz;
-        }
-    }
-
-    LLAMA_LOG_INFO("MoE expert cache: resolves = %" PRIu64 ", resident routes = %" PRIu64 ", streamed routes = %" PRIu64
-                   ", hits = %" PRIu64 ", misses = %" PRIu64 ", evictions = %" PRIu64
-                   ", H2D = %.2f MiB, host reads = %.2f MiB, fill = %.3f ms\n",
-                   total.resolve_calls, total.resident_routes, total.streamed_routes, total.cache_hits,
-                   total.cache_misses, total.evictions, total.h2d_bytes / 1048576.0,
-                   total.host_expert_bytes / 1048576.0, fill_ms);
-}
-
-void llama_moe_expert_cache::reset_stats() {
-    for (const auto & group : pimpl->groups) {
-        if (group->handle != nullptr) {
-            group->api->reset_stats(group->handle);
-        }
-    }
 }
 
 std::map<ggml_backend_buffer_type_t, size_t> llama_moe_expert_cache::memory_breakdown() const {

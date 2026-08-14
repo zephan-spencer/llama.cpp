@@ -24,6 +24,8 @@ struct ggml_backend_meta_buffer_type;
 struct ggml_backend_meta_buffer;
 struct ggml_backend_meta;
 
+static bool ggml_backend_meta_moe_cache_is_plan(const ggml_tensor * tensor);
+
 const char * ggml_backend_meta_split_axis_name(enum ggml_backend_meta_split_axis split_axis) {
     switch (split_axis) {
         case GGML_BACKEND_SPLIT_AXIS_0:
@@ -151,6 +153,9 @@ static ggml_backend_buffer_type_t ggml_backend_meta_device_get_host_buffer_type(
 
 static bool ggml_backend_meta_device_supports_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
     GGML_ASSERT(ggml_backend_dev_is_meta(dev));
+    if (ggml_backend_meta_moe_cache_is_plan(op)) {
+        return true;
+    }
     const ggml_backend_meta_device_context * meta_dev_ctx = (const ggml_backend_meta_device_context *) dev->context;
     return std::all_of(meta_dev_ctx->simple_devs.begin(), meta_dev_ctx->simple_devs.end(),
         [op](ggml_backend_dev_t simple_dev) { return ggml_backend_dev_supports_op(simple_dev, op); });
@@ -253,11 +258,11 @@ struct ggml_backend_meta_buffer_type_context {
 
     ggml_backend_meta_buffer_type_context(std::vector<ggml_backend_buffer_type_t> simple_bufts) : simple_bufts(std::move(simple_bufts)) {
         name = "Meta(";
-        for (size_t i = 0; i < simple_bufts.size(); i++) {
+        for (size_t i = 0; i < this->simple_bufts.size(); i++) {
             if (i > 0) {
                 name += ",";
             }
-            name += ggml_backend_buft_name(simple_bufts[i]);
+            name += ggml_backend_buft_name(this->simple_bufts[i]);
         }
         name += ")";
     }
@@ -381,8 +386,6 @@ static ggml_backend_buffer_type_t ggml_backend_meta_device_get_host_buffer_type(
         if (host_buft == nullptr) {
             host_buft = simple_host_buft;
         } else if (host_buft != simple_host_buft) {
-            // if different simple devices have different host buffer types,
-            // we cannot provide a single host buffer type for the meta device
             return nullptr;
         }
     }
@@ -483,7 +486,58 @@ static struct ggml_tensor * ggml_backend_meta_buffer_simple_tensor(const struct 
     return it->second[index];
 }
 
-static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(const struct ggml_tensor * tensor, bool assume_sync);
+#define GGML_BACKEND_META_MOE_CACHE_PLAN_MAGIC     0x4d455441504c414eULL
+#define GGML_BACKEND_META_MOE_CACHE_SELECTOR_MAGIC 0x4d45544153454c45ULL
+
+struct ggml_backend_meta_moe_cache;
+
+struct ggml_backend_meta_moe_cache_plan_desc {
+    uint64_t                      magic;
+    ggml_backend_meta_moe_cache * cache;
+};
+
+struct ggml_backend_meta_moe_cache_selector_desc {
+    uint64_t                      magic;
+    ggml_backend_meta_moe_cache * cache;
+};
+
+struct ggml_backend_meta_moe_cache_child {
+    const ggml_backend_moe_cache_i * api    = nullptr;
+    ggml_backend_moe_cache_t         handle = nullptr;
+};
+
+struct ggml_backend_meta_moe_cache {
+    ggml_tensor *                                  state = nullptr;
+    uint32_t                                       n_weights;
+    std::vector<ggml_tensor *>                     slots;
+    std::vector<ggml_backend_meta_moe_cache_child> children;
+    ggml_backend_meta_moe_cache_plan_desc          plan_desc;
+    ggml_backend_meta_moe_cache_selector_desc      selector_desc;
+};
+
+static ggml_backend_meta_moe_cache_plan_desc * ggml_backend_meta_moe_cache_plan_desc_for(const ggml_tensor * tensor) {
+    if (tensor == nullptr || tensor->op != GGML_OP_CUSTOM) {
+        return nullptr;
+    }
+    ggml_custom_op_params params;
+    memcpy(&params, tensor->op_params, sizeof(params));
+    auto * desc = static_cast<ggml_backend_meta_moe_cache_plan_desc *>(params.userdata);
+    return params.fun == nullptr && desc != nullptr && desc->magic == GGML_BACKEND_META_MOE_CACHE_PLAN_MAGIC ? desc :
+                                                                                                               nullptr;
+}
+
+static bool ggml_backend_meta_moe_cache_is_plan(const ggml_tensor * tensor) {
+    return ggml_backend_meta_moe_cache_plan_desc_for(tensor) != nullptr;
+}
+
+static ggml_backend_meta_moe_cache_selector_desc * ggml_backend_meta_moe_cache_selector_desc_for(
+    const ggml_tensor * tensor) {
+    auto * desc = tensor == nullptr ? nullptr : static_cast<ggml_backend_meta_moe_cache_selector_desc *>(tensor->extra);
+    return desc != nullptr && desc->magic == GGML_BACKEND_META_MOE_CACHE_SELECTOR_MAGIC ? desc : nullptr;
+}
+
+static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(const struct ggml_tensor * tensor,
+                                                                              bool                       assume_sync);
 
 static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
         ggml_backend_meta_simple_tensor_container & stc, const struct ggml_tensor * tensor, bool assume_sync) {
@@ -785,6 +839,9 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
     auto calculate_split_state = [&]() -> ggml_backend_meta_split_state {
         if (ggml_nelements(tensor) == 0) {
             return {GGML_BACKEND_SPLIT_AXIS_UNKNOWN, {0}, {1}, 1};
+        }
+        if (ggml_backend_meta_moe_cache_plan_desc_for(tensor) != nullptr) {
+            return { GGML_BACKEND_SPLIT_AXIS_MIRRORED, { 0 }, { 1 }, 1 };
         }
         if (ggml_backend_buffer_get_usage(tensor->buffer) != GGML_BACKEND_BUFFER_USAGE_COMPUTE && tensor->view_src == nullptr) {
             ggml_backend_dev_t dev = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(tensor->buffer));
@@ -1215,6 +1272,27 @@ static enum ggml_status ggml_backend_meta_buffer_init_tensor_impl(ggml_backend_m
             } else if (t_ij->src[i] != nullptr && ggml_backend_buffer_is_meta(t_ij->src[i]->buffer)) {
                 t_ij->src[i] = ggml_backend_meta_buffer_simple_tensor(tensor->src[i], j);
             }
+        }
+
+        if (auto * plan_desc = ggml_backend_meta_moe_cache_plan_desc_for(tensor)) {
+            ggml_backend_meta_moe_cache * cache = plan_desc->cache;
+            GGML_ASSERT(cache != nullptr && j < cache->children.size());
+            const ggml_backend_meta_moe_cache_child & child = cache->children[j];
+            const ggml_backend_moe_cache_plan         plan =
+                child.api->build_plan(child.handle, simple_ctx, t_ij->src[0], t_ij->src[1], t_ij->src[2]);
+            GGML_ASSERT(plan.execution != nullptr && plan.selectors != nullptr);
+            GGML_ASSERT(plan.execution->type == t_ij->type && ggml_are_same_shape(plan.execution, t_ij));
+
+            t_ij->op = plan.execution->op;
+            memcpy(t_ij->op_params, plan.execution->op_params, sizeof(t_ij->op_params));
+            for (int i = 0; i < GGML_MAX_SRC; ++i) {
+                t_ij->src[i] = plan.execution->src[i];
+            }
+            t_ij->extra = plan.selectors->extra;
+        } else if (auto * selector_desc = ggml_backend_meta_moe_cache_selector_desc_for(tensor)) {
+            ggml_backend_meta_moe_cache * cache = selector_desc->cache;
+            GGML_ASSERT(cache != nullptr && t_ij->view_src != nullptr);
+            t_ij->extra = t_ij->view_src->extra;
         }
 
         simple_tensors.push_back(t_ij);
@@ -2268,4 +2346,186 @@ ggml_backend_t ggml_backend_meta_simple_backend(ggml_backend_t meta_backend, siz
     GGML_ASSERT(ggml_backend_is_meta(meta_backend));
     const ggml_backend_meta_context * backend_ctx = (const ggml_backend_meta_context *) meta_backend->context;
     return backend_ctx->backend_configs[index].backend;
+}
+
+static ggml_backend_buffer_type_t ggml_backend_meta_moe_cache_source_buffer_type(ggml_backend_dev_t device) {
+    if (!ggml_backend_dev_is_meta(device)) {
+        return nullptr;
+    }
+    static std::map<ggml_backend_dev_t, struct ggml_backend_buffer_type> source_bufts;
+    const auto                                                           found = source_bufts.find(device);
+    if (found != source_bufts.end()) {
+        return &found->second;
+    }
+
+    const auto *                     ctx       = static_cast<const ggml_backend_meta_device_context *>(device->context);
+    const ggml_backend_moe_cache_i * child_api = nullptr;
+    std::vector<ggml_backend_buffer_type_t> child_bufts;
+    child_bufts.reserve(ctx->simple_devs.size());
+    for (ggml_backend_dev_t child : ctx->simple_devs) {
+        const ggml_backend_moe_cache_i * api = ggml_backend_moe_cache_get_interface(child);
+        if (api == nullptr || (child_api != nullptr && api != child_api)) {
+            return nullptr;
+        }
+        ggml_backend_buffer_type_t buft = api->get_source_buffer_type(child);
+        if (buft == nullptr) {
+            return nullptr;
+        }
+        child_api = api;
+        child_bufts.push_back(buft);
+    }
+    if (child_bufts.empty()) {
+        return nullptr;
+    }
+
+    auto *                          buft_ctx    = new ggml_backend_meta_buffer_type_context(std::move(child_bufts));
+    struct ggml_backend_buffer_type source_buft = {
+        /*iface  =*/ggml_backend_meta_buffer_type_iface,
+        /*device =*/device,
+        /*ctx    =*/buft_ctx,
+    };
+    return &source_bufts.emplace(device, source_buft).first->second;
+}
+
+static size_t ggml_backend_meta_moe_cache_state_size(ggml_backend_dev_t device,
+                                                     uint32_t           n_expert,
+                                                     uint32_t           n_cache,
+                                                     uint32_t           n_weights) {
+    if (ggml_backend_meta_moe_cache_source_buffer_type(device) == nullptr) {
+        return 0;
+    }
+    const auto * ctx    = static_cast<const ggml_backend_meta_device_context *>(device->context);
+    size_t       result = 0;
+    for (ggml_backend_dev_t child : ctx->simple_devs) {
+        const ggml_backend_moe_cache_i * api = ggml_backend_moe_cache_get_interface(child);
+        result = std::max(result, api->get_state_size(child, n_expert, n_cache, n_weights));
+    }
+    return result;
+}
+
+static ggml_backend_moe_cache_t ggml_backend_meta_moe_cache_create(ggml_backend_t        backend,
+                                                                   ggml_tensor *         state,
+                                                                   ggml_tensor * const * source,
+                                                                   ggml_tensor * const * slots,
+                                                                   uint32_t              n_expert,
+                                                                   uint32_t              n_cache,
+                                                                   uint32_t              n_weights) {
+    if (!ggml_backend_is_meta(backend) || state == nullptr || source == nullptr || slots == nullptr ||
+        state->buffer == nullptr || !ggml_backend_buffer_is_meta(state->buffer) || n_weights == 0 ||
+        n_weights > GGML_BACKEND_MOE_CACHE_MAX_WEIGHTS) {
+        return nullptr;
+    }
+    for (uint32_t i = 0; i < n_weights; ++i) {
+        if (source[i] == nullptr || slots[i] == nullptr || source[i]->buffer == nullptr ||
+            slots[i]->buffer == nullptr || !ggml_backend_buffer_is_meta(source[i]->buffer) ||
+            !ggml_backend_buffer_is_meta(slots[i]->buffer) || !ggml_backend_buffer_is_host(source[i]->buffer)) {
+            return nullptr;
+        }
+    }
+
+    auto * cache     = new ggml_backend_meta_moe_cache{};
+    cache->state     = state;
+    cache->n_weights = n_weights;
+    cache->slots.assign(slots, slots + n_weights);
+    cache->plan_desc     = { GGML_BACKEND_META_MOE_CACHE_PLAN_MAGIC, cache };
+    cache->selector_desc = { GGML_BACKEND_META_MOE_CACHE_SELECTOR_MAGIC, cache };
+
+    const size_t                     n_backends = ggml_backend_meta_n_backends(backend);
+    const ggml_backend_moe_cache_i * child_api  = nullptr;
+    cache->children.reserve(n_backends);
+    for (size_t j = 0; j < n_backends; ++j) {
+        ggml_backend_t                   child_backend = ggml_backend_meta_simple_backend(backend, j);
+        ggml_backend_dev_t               child_device  = ggml_backend_get_device(child_backend);
+        const ggml_backend_moe_cache_i * api           = ggml_backend_moe_cache_get_interface(child_device);
+        ggml_tensor *                    child_state   = ggml_backend_meta_buffer_simple_tensor(state, j);
+        if (api == nullptr || (child_api != nullptr && api != child_api) || child_state == nullptr ||
+            ggml_nbytes(child_state) < api->get_state_size(child_device, n_expert, n_cache, n_weights)) {
+            goto fail;
+        }
+        child_api = api;
+
+        ggml_tensor * child_sources[GGML_BACKEND_MOE_CACHE_MAX_WEIGHTS] = {};
+        ggml_tensor * child_slots[GGML_BACKEND_MOE_CACHE_MAX_WEIGHTS]   = {};
+        for (uint32_t i = 0; i < n_weights; ++i) {
+            child_sources[i] = ggml_backend_meta_buffer_simple_tensor(source[i], j);
+            child_slots[i]   = ggml_backend_meta_buffer_simple_tensor(slots[i], j);
+        }
+        ggml_backend_moe_cache_t handle =
+            api->create(child_backend, child_state, child_sources, child_slots, n_expert, n_cache, n_weights);
+        if (handle == nullptr) {
+            goto fail;
+        }
+        cache->children.push_back({ api, handle });
+    }
+
+    return reinterpret_cast<ggml_backend_moe_cache_t>(cache);
+
+fail:
+    for (const auto & child : cache->children) {
+        child.api->destroy(child.handle);
+    }
+    delete cache;
+    return nullptr;
+}
+
+static void ggml_backend_meta_moe_cache_destroy(ggml_backend_moe_cache_t opaque) {
+    auto * cache = reinterpret_cast<ggml_backend_meta_moe_cache *>(opaque);
+    if (cache == nullptr) {
+        return;
+    }
+    for (const auto & child : cache->children) {
+        child.api->destroy(child.handle);
+    }
+    delete cache;
+}
+
+static ggml_backend_moe_cache_plan ggml_backend_meta_moe_cache_build_plan(ggml_backend_moe_cache_t opaque,
+                                                                          ggml_context *           ctx,
+                                                                          ggml_tensor *            ids,
+                                                                          ggml_tensor *            token_priority,
+                                                                          ggml_tensor *            epoch) {
+    auto * cache = reinterpret_cast<ggml_backend_meta_moe_cache *>(opaque);
+    if (cache == nullptr || ctx == nullptr || ids == nullptr || token_priority == nullptr || epoch == nullptr ||
+        cache->children.empty()) {
+        return { nullptr, nullptr };
+    }
+
+    // Physical plans share this shape and are built when the meta graph is decomposed.
+    const auto &                      prototype_child = cache->children.front();
+    const ggml_backend_moe_cache_plan prototype =
+        prototype_child.api->build_plan(prototype_child.handle, ctx, ids, token_priority, epoch);
+    if (prototype.execution == nullptr || prototype.selectors == nullptr) {
+        return { nullptr, nullptr };
+    }
+
+    ggml_tensor * args[4 + GGML_BACKEND_MOE_CACHE_MAX_WEIGHTS] = {};
+    args[0]                                                    = ids;
+    args[1]                                                    = token_priority;
+    args[2]                                                    = epoch;
+    args[3]                                                    = cache->state;
+    for (uint32_t i = 0; i < cache->n_weights; ++i) {
+        args[4 + i] = cache->slots[i];
+    }
+    ggml_tensor * execution =
+        ggml_custom_4d(ctx, prototype.execution->type, prototype.execution->ne[0], prototype.execution->ne[1],
+                       prototype.execution->ne[2], prototype.execution->ne[3], args, 4 + cache->n_weights, nullptr, 1,
+                       &cache->plan_desc);
+    ggml_tensor * selectors =
+        ggml_view_4d(ctx, execution, prototype.selectors->ne[0], prototype.selectors->ne[1], prototype.selectors->ne[2],
+                     prototype.selectors->ne[3], prototype.selectors->nb[1], prototype.selectors->nb[2],
+                     prototype.selectors->nb[3], prototype.selectors->view_offs);
+    selectors->extra = &cache->selector_desc;
+    return { selectors, execution };
+}
+
+static const ggml_backend_moe_cache_i ggml_backend_meta_moe_cache_interface = {
+    ggml_backend_meta_moe_cache_source_buffer_type,
+    ggml_backend_meta_moe_cache_state_size,
+    ggml_backend_meta_moe_cache_create,
+    ggml_backend_meta_moe_cache_destroy,
+    ggml_backend_meta_moe_cache_build_plan,
+};
+
+const ggml_backend_moe_cache_i * ggml_backend_meta_moe_cache_get_interface() {
+    return &ggml_backend_meta_moe_cache_interface;
 }

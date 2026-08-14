@@ -664,6 +664,25 @@ void * ggml_backend_reg_get_proc_address(ggml_backend_reg_t reg, const char * na
     return reg->iface.get_proc_address(reg, name);
 }
 
+const ggml_backend_moe_cache_i * ggml_backend_moe_cache_get_interface(ggml_backend_dev_t device) {
+    if (device == NULL) {
+        return NULL;
+    }
+    if (ggml_backend_dev_type(device) == GGML_BACKEND_DEVICE_TYPE_META) {
+        return ggml_backend_meta_moe_cache_get_interface();
+    }
+
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(device);
+    if (reg == NULL) {
+        return NULL;
+    }
+
+    ggml_backend_moe_cache_get_interface_t get_interface =
+        (ggml_backend_moe_cache_get_interface_t) ggml_backend_reg_get_proc_address(
+            reg, "ggml_backend_moe_cache_get_interface");
+    return get_interface != NULL ? get_interface() : NULL;
+}
+
 // multi-buffer buffer
 
 struct ggml_backend_multi_buffer_context {

@@ -45,8 +45,6 @@ class llama_moe_expert_cache {
     void     begin_batch();
     uint32_t epoch() const;
     void     print_info();
-    void     print_stats() const;
-    void     reset_stats();
 
     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const;
 

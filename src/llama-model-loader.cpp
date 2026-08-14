@@ -1420,7 +1420,9 @@ struct ggml_tensor * llama_model_loader::create_tensor(const llama_hparams &    
         }
 
         if (moe_cache_weight) {
-            buft = select_weight_buft(hparams, t_meta, op, buft_list_cpu);
+            const ggml_backend_dev_t         target = buft_list->front().first;
+            const ggml_backend_moe_cache_i * api    = ggml_backend_moe_cache_get_interface(target);
+            buft                                    = api != nullptr ? api->get_source_buffer_type(target) : nullptr;
             if (!buft) {
                 throw std::runtime_error("MoE expert cache: failed to find a host buffer type for " + tn.str());
             }

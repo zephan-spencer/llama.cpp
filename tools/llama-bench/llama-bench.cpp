@@ -723,6 +723,12 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                     break;
                 }
                 auto p = parse_int_range(argv[i]);
+                if (std::find(p.begin(), p.end(), 0) != p.end()) {
+                    fprintf(stderr,
+                            "error: --moe-cache-experts must be positive; omit the option to disable the cache\n");
+                    invalid_param = true;
+                    break;
+                }
                 params.n_moe_cache_experts.insert(params.n_moe_cache_experts.end(), p.begin(), p.end());
             } else if (llama_supports_rpc() && (arg == "-rpc" || arg == "--rpc")) {
                 if (++i >= argc) {
@@ -1233,10 +1239,6 @@ struct cmd_params_instance {
         if (n_moe_cache_experts > 0 && n_cpu_moe > 0) {
             throw std::invalid_argument("--moe-cache-experts cannot be combined with --n-cpu-moe");
         }
-        if (n_moe_cache_experts > 0 && split_mode == LLAMA_SPLIT_MODE_TENSOR) {
-            throw std::invalid_argument("--moe-cache-experts does not support tensor parallelism");
-        }
-
         mparams.n_gpu_layers = n_gpu_layers;
         mparams.n_moe_cache_experts = n_moe_cache_experts;
         if (!devices.empty()) {

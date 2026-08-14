@@ -3254,15 +3254,6 @@ void llama_context::perf_reset() {
     t_eval_us   = n_eval = 0;
     t_p_eval_us = n_p_eval = 0;
     n_reused    = 0;
-    if (moe_cache) {
-        moe_cache->reset_stats();
-    }
-}
-
-void llama_context::perf_print_cache() const {
-    if (moe_cache) {
-        moe_cache->print_stats();
-    }
 }
 
 llama_memory_breakdown llama_context::memory_breakdown() const {
@@ -4175,9 +4166,6 @@ void llama_perf_context_print(const llama_context * ctx) {
             __func__, data.t_eval_ms, data.n_eval, data.t_eval_ms / data.n_eval, 1e3 / data.t_eval_ms * data.n_eval);
     LLAMA_LOG_INFO("%s:       total time = %10.2f ms / %5d tokens\n", __func__, (t_end_ms - data.t_start_ms), (data.n_p_eval + data.n_eval));
     LLAMA_LOG_INFO("%s:    graphs reused = %10d\n", __func__, data.n_reused);
-    if (ctx != nullptr) {
-        ctx->perf_print_cache();
-    }
 }
 
 void llama_perf_context_reset(llama_context * ctx) {

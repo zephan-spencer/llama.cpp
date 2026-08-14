@@ -11,13 +11,18 @@
 
 #if defined(GGML_USE_HIP)
 
-static bool ggml_backend_cuda_moe_cache_supports(ggml_backend_dev_t device) {
-    return device != nullptr && ggml_backend_dev_type(device) == GGML_BACKEND_DEVICE_TYPE_GPU;
+static ggml_backend_buffer_type_t ggml_backend_cuda_moe_cache_source_buffer_type(ggml_backend_dev_t device) {
+    return device != nullptr && ggml_backend_dev_type(device) == GGML_BACKEND_DEVICE_TYPE_GPU ?
+               ggml_backend_dev_host_buffer_type(device) :
+               nullptr;
 }
 
-static size_t ggml_backend_cuda_moe_cache_state_size(uint32_t n_expert, uint32_t n_cache, uint32_t n_weights) {
-    if (n_expert == 0 || n_cache == 0 || n_cache >= n_expert || n_weights == 0 ||
-        n_weights > GGML_BACKEND_MOE_CACHE_MAX_WEIGHTS) {
+static size_t ggml_backend_cuda_moe_cache_state_size(ggml_backend_dev_t device,
+                                                     uint32_t           n_expert,
+                                                     uint32_t           n_cache,
+                                                     uint32_t           n_weights) {
+    if (ggml_backend_cuda_moe_cache_source_buffer_type(device) == nullptr || n_expert == 0 || n_cache == 0 ||
+        n_cache >= n_expert || n_weights == 0 || n_weights > GGML_BACKEND_MOE_CACHE_MAX_WEIGHTS) {
         return 0;
     }
     return ggml_cuda_expert_cache_layout(n_expert, n_cache).state_size;
@@ -30,23 +35,21 @@ static ggml_backend_moe_cache_t ggml_backend_cuda_moe_cache_create(ggml_backend_
                                                                    uint32_t              n_expert,
                                                                    uint32_t              n_cache,
                                                                    uint32_t              n_weights) {
-    const size_t state_size = ggml_backend_cuda_moe_cache_state_size(n_expert, n_cache, n_weights);
+    const ggml_backend_dev_t device     = backend != nullptr ? ggml_backend_get_device(backend) : nullptr;
+    const size_t             state_size = ggml_backend_cuda_moe_cache_state_size(device, n_expert, n_cache, n_weights);
     if (backend == nullptr || state_size == 0 || state == nullptr || source == nullptr || slots == nullptr ||
         state->buffer == nullptr || ggml_nbytes(state) < state_size) {
         return nullptr;
     }
 
-    const ggml_backend_dev_t device = ggml_backend_get_device(backend);
     if (device == nullptr || ggml_backend_buft_get_device(ggml_backend_buffer_get_type(state->buffer)) != device) {
         return nullptr;
     }
 
     auto * cache                       = new ggml_backend_moe_cache{};
-    cache->backend                     = backend;
     cache->state                       = state;
     auto & desc                        = cache->desc;
     desc.magic                         = GGML_CUDA_EXPERT_CACHE_MAGIC;
-    desc.version                       = GGML_CUDA_EXPERT_CACHE_VERSION;
     desc.n_expert                      = n_expert;
     desc.n_cache                       = n_cache;
     desc.n_weights                     = n_weights;
@@ -141,25 +144,12 @@ static ggml_backend_moe_cache_plan ggml_backend_cuda_moe_cache_build_plan(ggml_b
     return { selectors, execution };
 }
 
-static void ggml_backend_cuda_moe_cache_get_stats(ggml_backend_moe_cache_t       cache,
-                                                  ggml_backend_moe_cache_stats * stats) {
-    ggml_backend_cuda_expert_cache_state state = {};
-    ggml_backend_tensor_get(cache->state, &state, 0, sizeof(state));
-    *stats               = state.stats;
-    stats->wall_clock_hz = cache->desc.wall_clock_hz;
-}
-
-static void ggml_backend_cuda_moe_cache_reset_stats(ggml_backend_moe_cache_t cache) {
-    const ggml_backend_moe_cache_stats zero = {};
-    ggml_backend_tensor_set_async(cache->backend, cache->state, &zero,
-                                  offsetof(ggml_backend_cuda_expert_cache_state, stats), sizeof(zero));
-}
-
 static const ggml_backend_moe_cache_i ggml_backend_cuda_moe_cache_interface = {
-    GGML_BACKEND_MOE_CACHE_INTERFACE_VERSION, ggml_backend_cuda_moe_cache_supports,
-    ggml_backend_cuda_moe_cache_state_size,   ggml_backend_cuda_moe_cache_create,
-    ggml_backend_cuda_moe_cache_destroy,      ggml_backend_cuda_moe_cache_build_plan,
-    ggml_backend_cuda_moe_cache_get_stats,    ggml_backend_cuda_moe_cache_reset_stats,
+    ggml_backend_cuda_moe_cache_source_buffer_type,
+    ggml_backend_cuda_moe_cache_state_size,
+    ggml_backend_cuda_moe_cache_create,
+    ggml_backend_cuda_moe_cache_destroy,
+    ggml_backend_cuda_moe_cache_build_plan,
 };
 
 extern "C" const ggml_backend_moe_cache_i * ggml_backend_cuda_moe_cache_get_interface() {
@@ -199,7 +189,7 @@ static ggml_backend_cuda_expert_cache_desc * expert_cache_desc(const ggml_tensor
     }
 
     auto * desc = static_cast<ggml_backend_cuda_expert_cache_desc *>(op_params.userdata);
-    if (desc->magic != GGML_CUDA_EXPERT_CACHE_MAGIC || desc->version != GGML_CUDA_EXPERT_CACHE_VERSION) {
+    if (desc->magic != GGML_CUDA_EXPERT_CACHE_MAGIC) {
         return nullptr;
     }
     return desc;
@@ -237,14 +227,6 @@ static __global__ void expert_cache_copy_kernel(uint8_t * state_data, expert_cac
         const auto *              src    = reinterpret_cast<const uint4 *>(cached.host + expert * cached.size);
         auto *                    dst    = reinterpret_cast<uint4 *>(cached.cache + slot * cached.size);
         dst[weight_offset]               = src[weight_offset];
-    }
-
-    __syncthreads();
-    if (threadIdx.x == 0) {
-        const uint32_t completed = atomicAdd(&header->copy_blocks_done, 1);
-        if (completed + 1 == gridDim.x && n_fills > 0) {
-            header->stats.fill_ticks += wall_clock64() - header->fill_start_ticks;
-        }
     }
 }
 
@@ -286,29 +268,9 @@ bool ggml_cuda_expert_cache_supported(const ggml_tensor * dst) {
     return true;
 }
 
-static void expert_cache_prepare_clock(ggml_backend_cuda_expert_cache_desc * desc) {
-    if (desc->wall_clock_hz != 0) {
-        return;
-    }
-
-    int        device         = 0;
-    int        wall_clock_khz = 0;
-    hipError_t error          = hipGetDevice(&device);
-    if (error != hipSuccess) {
-        GGML_ABORT("failed to get expert cache device: %s", hipGetErrorString(error));
-    }
-    error = hipDeviceGetAttribute(&wall_clock_khz, hipDeviceAttributeWallClockRate, device);
-    if (error != hipSuccess) {
-        GGML_ABORT("failed to get expert cache wall clock: %s", hipGetErrorString(error));
-    }
-    desc->wall_clock_hz = (uint64_t) wall_clock_khz * 1000;
-}
-
 void ggml_cuda_expert_cache(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_backend_cuda_expert_cache_desc * desc = expert_cache_desc(dst);
     GGML_ASSERT(desc != nullptr);
-
-    expert_cache_prepare_clock(desc);
 
     const int priority_index = 1;
     const int epoch_index    = 2;
@@ -371,21 +333,9 @@ void ggml_cuda_expert_cache(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
     plan.token_priority         = static_cast<const int32_t *>(dst->src[priority_index]->data);
     plan.epoch                  = static_cast<const int32_t *>(dst->src[epoch_index]->data);
     plan.use_clock              = &header->use_clock;
-    plan.n_active               = &header->n_active;
-    plan.n_resident             = &header->n_resident;
-    plan.n_miss                 = &header->n_misses;
     plan.n_fill                 = &header->n_fills;
-    plan.n_evictions            = &header->n_evictions;
-    plan.n_streamed             = &header->n_streamed;
-    plan.n_host_experts         = &header->n_host_experts;
-    plan.stats                  = &header->stats;
-    plan.fill_start_ticks       = &header->fill_start_ticks;
-    plan.copy_blocks_done       = &header->copy_blocks_done;
     plan.resolve_active         = &header->resolve_active;
     plan.policy_flags           = &header->policy_flags;
-    for (uint32_t i = 0; i < params.n_weights; ++i) {
-        plan.bytes_per_fill += params.weights[i].size;
-    }
 
     const int n_expert_used = dst->src[0]->ne[0];
     const int n_tokens      = ggml_nelements(dst->src[0]) / n_expert_used;
