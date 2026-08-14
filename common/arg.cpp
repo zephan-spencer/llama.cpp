@@ -901,6 +901,9 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
     if (params.n_moe_cache_experts > 0 && params.cpu_moe) {
         throw std::invalid_argument("error: --moe-cache-experts cannot be combined with --cpu-moe or --n-cpu-moe\n");
     }
+    if (params.n_moe_cache_experts > 0 && params.split_mode == LLAMA_SPLIT_MODE_TENSOR) {
+        throw std::invalid_argument("error: --moe-cache-experts does not support tensor parallelism\n");
+    }
     const bool skip_model_download =
         // server will call common_params_handle_models() later, so we skip it here
         ctx_arg.ex == LLAMA_EXAMPLE_SERVER ||
