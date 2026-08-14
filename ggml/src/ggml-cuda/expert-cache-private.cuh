@@ -1,6 +1,6 @@
 #pragma once
 
-#include "ggml-backend.h"
+#include "ggml-backend-moe-cache.h"
 
 #define GGML_CUDA_EXPERT_CACHE_MAGIC   0x4558504341434845ULL
 #define GGML_CUDA_EXPERT_SOURCE_MAGIC  0x4558505352430001ULL
