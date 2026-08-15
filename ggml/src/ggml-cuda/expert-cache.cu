@@ -116,6 +116,31 @@ static void ggml_backend_cuda_moe_cache_destroy(ggml_backend_moe_cache_t cache) 
     delete cache;
 }
 
+static bool ggml_backend_cuda_moe_cache_get_plan_layout(
+    ggml_backend_moe_cache_t               cache,
+    const ggml_tensor *                    ids,
+    ggml_backend_moe_cache_plan_layout *   result) {
+    if (cache == nullptr || ids == nullptr || result == nullptr || ids->type != GGML_TYPE_I32) {
+        return false;
+    }
+
+    const auto route_layout = ggml_cuda_expert_cache_route_layout(ggml_nelements(ids), cache->desc.n_expert);
+
+    *result                 = {};
+    result->execution_type  = GGML_TYPE_I32;
+    result->execution_ne[0] = route_layout.size / sizeof(int32_t);
+    result->execution_ne[1] = 1;
+    result->execution_ne[2] = 1;
+    result->execution_ne[3] = 1;
+    result->selectors_type  = GGML_TYPE_I32;
+    for (int i = 0; i < GGML_MAX_DIMS; ++i) {
+        result->selectors_ne[i] = ids->ne[i];
+        result->selectors_nb[i] = ids->nb[i];
+    }
+    result->selectors_offset = route_layout.selectors_offset;
+    return true;
+}
+
 static ggml_backend_moe_cache_plan ggml_backend_cuda_moe_cache_build_plan(ggml_backend_moe_cache_t cache,
                                                                           ggml_context *           ctx,
                                                                           ggml_tensor *            ids,
@@ -126,8 +151,12 @@ static ggml_backend_moe_cache_plan ggml_backend_cuda_moe_cache_build_plan(ggml_b
         ggml_nelements(token_priority) != ids->ne[1] || ggml_nelements(epoch) != 1) {
         return { nullptr, nullptr };
     }
-    const int64_t n_routes = ggml_nelements(ids);
-    const auto    layout   = ggml_cuda_expert_cache_route_layout(n_routes, cache->desc.n_expert);
+
+    ggml_backend_moe_cache_plan_layout layout;
+    if (!ggml_backend_cuda_moe_cache_get_plan_layout(cache, ids, &layout)) {
+        return { nullptr, nullptr };
+    }
+
     ggml_tensor * args[4 + GGML_BACKEND_MOE_CACHE_MAX_WEIGHTS] = {};
     args[0]                                                    = ids;
     args[1]                                                    = token_priority;
@@ -136,10 +165,12 @@ static ggml_backend_moe_cache_plan ggml_backend_cuda_moe_cache_build_plan(ggml_b
     for (uint32_t i = 0; i < cache->desc.n_weights; ++i) {
         args[4 + i] = cache->slots[i];
     }
-    auto * execution = ggml_custom_4d(ctx, GGML_TYPE_I32, layout.size / sizeof(int32_t), 1, 1, 1, args,
+    auto * execution = ggml_custom_4d(ctx, layout.execution_type, layout.execution_ne[0], layout.execution_ne[1],
+                                      layout.execution_ne[2], layout.execution_ne[3], args,
                                       4 + cache->desc.n_weights, nullptr, 1, &cache->desc);
-    auto * selectors = ggml_view_4d(ctx, execution, ids->ne[0], ids->ne[1], ids->ne[2], ids->ne[3], ids->nb[1],
-                                    ids->nb[2], ids->nb[3], layout.selectors_offset);
+    auto * selectors = ggml_view_4d(ctx, execution, layout.selectors_ne[0], layout.selectors_ne[1],
+                                    layout.selectors_ne[2], layout.selectors_ne[3], layout.selectors_nb[1],
+                                    layout.selectors_nb[2], layout.selectors_nb[3], layout.selectors_offset);
     selectors->extra = &cache->plan_binding;
     return { selectors, execution };
 }
@@ -149,6 +180,7 @@ static const ggml_backend_moe_cache_i ggml_backend_cuda_moe_cache_interface = {
     ggml_backend_cuda_moe_cache_state_size,
     ggml_backend_cuda_moe_cache_create,
     ggml_backend_cuda_moe_cache_destroy,
+    ggml_backend_cuda_moe_cache_get_plan_layout,
     ggml_backend_cuda_moe_cache_build_plan,
 };
 

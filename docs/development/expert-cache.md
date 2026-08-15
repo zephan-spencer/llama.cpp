@@ -37,6 +37,8 @@ Source tensors and backend handles have context lifetime. Graph plan tensors hav
 
 `create` receives one backend, one allocated state tensor, ordered source and slot arrays, expert count, capacity, and projection count. Creation validates buffer ownership, host visibility, tensor types, expert dimensions, slot dimensions, and expert strides. Failure returns a null handle and leaves tensor bindings unchanged.
 
+`get_plan_layout(handle, logical_ids, layout)` reports the execution tensor type and shape plus the selector tensor type, shape, strides, and byte offset. It creates no graph tensors.
+
 `build_plan(handle, context, logical_ids, token_priority, epoch)` returns:
 
 - `selectors`: integer source selectors consumed by cached `MUL_MAT_ID` operations.

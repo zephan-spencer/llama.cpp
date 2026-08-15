@@ -15,6 +15,15 @@ extern "C" {
         struct ggml_tensor * execution;
     };
 
+    struct ggml_backend_moe_cache_plan_layout {
+        enum ggml_type execution_type;
+        int64_t        execution_ne[GGML_MAX_DIMS];
+        enum ggml_type selectors_type;
+        int64_t        selectors_ne[GGML_MAX_DIMS];
+        size_t         selectors_nb[GGML_MAX_DIMS];
+        size_t         selectors_offset;
+    };
+
     struct ggml_backend_moe_cache_i {
         ggml_backend_buffer_type_t (*get_source_buffer_type)(ggml_backend_dev_t device);
         size_t (*get_state_size)(ggml_backend_dev_t device, uint32_t n_expert, uint32_t n_cache, uint32_t n_weights);
@@ -27,6 +36,10 @@ extern "C" {
             uint32_t n_cache,
             uint32_t n_weights);
         void (*destroy)(ggml_backend_moe_cache_t cache);
+        bool (*get_plan_layout)(
+            ggml_backend_moe_cache_t cache,
+            const struct ggml_tensor * logical_ids,
+            struct ggml_backend_moe_cache_plan_layout * layout);
         struct ggml_backend_moe_cache_plan (*build_plan)(
             ggml_backend_moe_cache_t cache,
             struct ggml_context * ctx,
