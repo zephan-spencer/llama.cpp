@@ -17,6 +17,10 @@ struct ggml_backend_meta_moe_cache {
     uint32_t                                       n_weights;
     std::vector<ggml_tensor *>                     slots;
     std::vector<ggml_backend_meta_moe_cache_child> children;
+    // The physical cache owns this opaque association.  Keep one per child
+    // here so selector materialization does not depend on the execution
+    // tensor's extra field or on view initialization order.
+    std::vector<void *>                             selector_bindings;
     ggml_backend_meta_tensor_adapter               execution_adapter;
     ggml_backend_meta_tensor_adapter               selector_adapter;
 };
@@ -99,6 +103,7 @@ static ggml_backend_moe_cache_t ggml_backend_meta_moe_cache_create(ggml_backend_
 
     const ggml_backend_moe_cache_i * child_api = nullptr;
     cache->children.reserve(n_backends);
+    cache->selector_bindings.resize(n_backends);
     for (size_t index = 0; index < n_backends; ++index) {
         ggml_backend_t                   child_backend = ggml_backend_meta_simple_backend(backend, index);
         ggml_backend_dev_t               child_device  = ggml_backend_get_device(child_backend);
@@ -201,13 +206,17 @@ static enum ggml_status ggml_backend_meta_moe_cache_materialize_execution(ggml_c
         !ggml_are_same_shape(plan.execution, tensor)) {
         return GGML_STATUS_FAILED;
     }
+    if (plan.selectors->extra == nullptr) {
+        return GGML_STATUS_FAILED;
+    }
 
     tensor->op = plan.execution->op;
     memcpy(tensor->op_params, plan.execution->op_params, sizeof(tensor->op_params));
     for (int source = 0; source < GGML_MAX_SRC; ++source) {
         tensor->src[source] = plan.execution->src[source];
     }
-    tensor->extra = plan.selectors->extra;
+    cache->selector_bindings[index] = plan.selectors->extra;
+    tensor->extra = nullptr;
     return GGML_STATUS_SUCCESS;
 }
 
@@ -216,12 +225,12 @@ static enum ggml_status ggml_backend_meta_moe_cache_materialize_selector(ggml_co
                                                                          size_t         index,
                                                                          void *         userdata) {
     GGML_UNUSED(ctx);
-    GGML_UNUSED(index);
-    GGML_UNUSED(userdata);
-    if (tensor->view_src == nullptr) {
+    auto * cache = static_cast<ggml_backend_meta_moe_cache *>(userdata);
+    if (cache == nullptr || index >= cache->selector_bindings.size() || tensor->view_src == nullptr ||
+        cache->selector_bindings[index] == nullptr) {
         return GGML_STATUS_FAILED;
     }
-    tensor->extra = tensor->view_src->extra;
+    tensor->extra = cache->selector_bindings[index];
     return GGML_STATUS_SUCCESS;
 }
 
