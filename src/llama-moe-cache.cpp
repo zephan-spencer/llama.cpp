@@ -126,8 +126,10 @@ struct llama_moe_expert_cache::impl {
 
         ggml_backend_t     backend      = backend_for_layer(il);
         ggml_backend_dev_t layer_device = backend ? ggml_backend_get_device(backend) : nullptr;
+        const enum ggml_backend_dev_type device_type =
+            layer_device != nullptr ? ggml_backend_dev_type(layer_device) : GGML_BACKEND_DEVICE_TYPE_CPU;
         if (backend == nullptr || layer_device == nullptr ||
-            ggml_backend_dev_type(layer_device) != GGML_BACKEND_DEVICE_TYPE_GPU) {
+            (device_type != GGML_BACKEND_DEVICE_TYPE_GPU && device_type != GGML_BACKEND_DEVICE_TYPE_META)) {
             throw std::runtime_error("MoE expert cache: every routed layer requires GPU placement");
         }
 
@@ -177,7 +179,11 @@ struct llama_moe_expert_cache::impl {
             for (int dimension = 0; dimension < GGML_MAX_DIMS; ++dimension) {
                 slots->nb[dimension] = tensor->nb[dimension];
             }
-            ggml_format_name(slots, "%s#moe_cache", tensor->name);
+            if (model.split_mode() == LLAMA_SPLIT_MODE_TENSOR) {
+                ggml_set_name(slots, tensor->name);
+            } else {
+                ggml_format_name(slots, "%s#moe_cache", tensor->name);
+            }
             result->weights.push_back({ tensor, slots });
         }
 

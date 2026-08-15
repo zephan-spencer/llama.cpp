@@ -11,29 +11,29 @@ The MoE expert cache keeps selected routed expert weight slices in GPU memory. C
 | Property | Current value |
 | --- | --- |
 | backend | ROCm/HIP |
-| accelerator topology | one physical HIP device |
+| accelerator topology | one physical HIP device or one tensor-parallel meta device over HIP devices |
 | model placement | every model layer on the accelerator |
-| split mode | none or single-device layer split |
+| split mode | none, layer, or tensor |
 | routed weight location | accelerator-visible host buffer |
 | automated matrix types | Q4_K and Q8_0 |
 | implemented matrix paths | MMQ and MMV/MMVQ |
 | projection layouts | gate and up, merged gate-up, down |
 
-Cache initialization rejects CPU layer placement, unsupported physical backends, incomplete routed tensors, tensor buffer overrides for routed weights, invalid capacities, and models without routed experts. Argument validation rejects tensor split mode with the expert cache enabled.
+Cache initialization rejects CPU layer placement, unsupported backends, incomplete routed tensors, tensor buffer overrides for routed weights, invalid capacities, and models without routed experts.
 
 ## Ownership
 
 `llama_moe_expert_cache` owns feature configuration, per-layer source tensors, cache-slot tensors, state tensors, device buffers, backend handles, synchronization, memory accounting, and logical-batch epochs.
 
-One backend handle owns one layer cache. The handle owns cache-state layout, source bindings, slot bindings, selector encoding, route-plan layout, replacement state, and transfer scheduling. Slot and plan bindings remain valid through handle destruction. Handle destruction clears every slot binding before releasing storage.
+One backend handle owns one layer cache. A meta handle owns one physical child handle per tensor-parallel device. The handle owns cache-state layout, source bindings, slot bindings, selector encoding, route-plan layout, replacement state, and transfer scheduling. Slot and plan bindings remain valid through handle destruction. Handle destruction clears every slot binding before releasing storage.
 
 Source tensors and backend handles have context lifetime. Graph plan tensors have graph lifetime. Cache state and slot storage have context lifetime.
 
 ## Backend interface
 
-`ggml_backend_moe_cache_get_interface(device)` returns the cache implementation for a physical device.
+`ggml_backend_moe_cache_get_interface(device)` returns the physical cache implementation or the cache meta adapter.
 
-`get_source_buffer_type(device)` returns the device-visible host buffer type used for routed weights. `get_state_size(device, n_expert, n_cache, n_weights)` returns the required state bytes or zero for an invalid configuration.
+`get_source_buffer_type(device)` returns the device-visible host buffer type used for routed weights. A meta source buffer contains one host shard per child device. `get_state_size(device, n_expert, n_cache, n_weights)` returns the required state bytes or zero for an invalid configuration.
 
 `create` receives one backend, one allocated state tensor, ordered source and slot arrays, expert count, capacity, and projection count. Creation validates buffer ownership, host visibility, tensor types, expert dimensions, slot dimensions, and expert strides. Failure returns a null handle and leaves tensor bindings unchanged.
 
@@ -56,7 +56,7 @@ route = token * n_expert_used + expert_rank
 
 `token_priority` uses type I32 and shape `[n_tokens]`. Zero identifies prompt work. A nonzero value identifies output-priority work. `epoch` uses type I32 and shape `[1]`.
 
-A routed source tensor has one expert slice along dimension two and `ne[3] = 1`. Each expert occupies `nb[2]` bytes. A physical-device source uses that device's host buffer type.
+A routed source tensor has one expert slice along dimension two and `ne[3] = 1`. Each expert occupies `nb[2]` bytes. A physical-device source uses that device's host buffer type. A meta-device source uses the composite host buffer for its child devices.
 
 A slot tensor preserves source type, `ne[0]`, `ne[1]`, `nb[0]`, `nb[1]`, and `nb[2]`. It uses `ne[2] = N` and `ne[3] = 1`. Every projection in one layer uses the same expert-to-slot mapping.
 

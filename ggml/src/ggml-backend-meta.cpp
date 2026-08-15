@@ -24,6 +24,13 @@ struct ggml_backend_meta_buffer_type;
 struct ggml_backend_meta_buffer;
 struct ggml_backend_meta;
 
+static constexpr uint64_t GGML_BACKEND_META_TENSOR_ADAPTER_MAGIC = 0x4d45544154454e53ULL;
+
+static const ggml_backend_meta_tensor_adapter * ggml_backend_meta_tensor_get_adapter(const ggml_tensor * tensor) {
+    const auto * adapter = tensor == nullptr ? nullptr : static_cast<const ggml_backend_meta_tensor_adapter *>(tensor->extra);
+    return adapter != nullptr && adapter->magic == GGML_BACKEND_META_TENSOR_ADAPTER_MAGIC ? adapter : nullptr;
+}
+
 const char * ggml_backend_meta_split_axis_name(enum ggml_backend_meta_split_axis split_axis) {
     switch (split_axis) {
         case GGML_BACKEND_SPLIT_AXIS_0:
@@ -153,6 +160,9 @@ static ggml_backend_buffer_type_t ggml_backend_meta_device_get_host_buffer_type(
 
 static bool ggml_backend_meta_device_supports_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
     GGML_ASSERT(ggml_backend_dev_is_meta(dev));
+    if (ggml_backend_meta_tensor_get_adapter(op) != nullptr) {
+        return true;
+    }
     const ggml_backend_meta_device_context * meta_dev_ctx = (const ggml_backend_meta_device_context *) dev->context;
     return std::all_of(meta_dev_ctx->simple_devs.begin(), meta_dev_ctx->simple_devs.end(),
         [op](ggml_backend_dev_t simple_dev) { return ggml_backend_dev_supports_op(simple_dev, op); });
@@ -199,13 +209,13 @@ static bool ggml_backend_dev_is_meta(ggml_backend_dev_t dev) {
     return dev != nullptr && dev->iface.get_name == ggml_backend_meta_device_iface.get_name;
 }
 
-static size_t ggml_backend_meta_dev_n_devs(ggml_backend_dev_t meta_dev) {
+size_t ggml_backend_meta_n_devices(ggml_backend_dev_t meta_dev) {
     GGML_ASSERT(ggml_backend_dev_is_meta(meta_dev));
     const ggml_backend_meta_device_context * meta_dev_ctx = (const ggml_backend_meta_device_context *) meta_dev->context;
     return meta_dev_ctx->simple_devs.size();
 }
 
-static ggml_backend_dev_t ggml_backend_meta_dev_simple_dev(ggml_backend_dev_t meta_dev, size_t index) {
+ggml_backend_dev_t ggml_backend_meta_simple_device(ggml_backend_dev_t meta_dev, size_t index) {
     GGML_ASSERT(ggml_backend_dev_is_meta(meta_dev));
     const ggml_backend_meta_device_context * meta_dev_ctx = (const ggml_backend_meta_device_context *) meta_dev->context;
     GGML_ASSERT(index < meta_dev_ctx->simple_devs.size());
@@ -344,30 +354,45 @@ bool ggml_backend_buft_is_meta(ggml_backend_buffer_type_t buft) {
 }
 
 static ggml_backend_buffer_type_t ggml_backend_meta_device_get_buffer_type(ggml_backend_dev_t dev) {
-    static std::map<ggml_backend_dev_t, struct ggml_backend_buffer_type> meta_bufts;
     GGML_ASSERT(ggml_backend_dev_is_meta(dev));
-    {
-        auto it = meta_bufts.find(dev);
-        if (it != meta_bufts.end()) {
-            return &it->second;
-        }
-    }
-
-    const size_t n_devs = ggml_backend_meta_dev_n_devs(dev);
+    const size_t n_devs = ggml_backend_meta_n_devices(dev);
     std::vector<ggml_backend_buffer_type_t> simple_bufts;
     simple_bufts.reserve(n_devs);
     for (size_t i = 0; i < n_devs; i++) {
-        simple_bufts.push_back(ggml_backend_dev_buffer_type(ggml_backend_meta_dev_simple_dev(dev, i)));
+        simple_bufts.push_back(ggml_backend_dev_buffer_type(ggml_backend_meta_simple_device(dev, i)));
     }
-    ggml_backend_meta_buffer_type_context * buft_ctx = new ggml_backend_meta_buffer_type_context(simple_bufts);
+    return ggml_backend_meta_buffer_type(dev, simple_bufts.data(), simple_bufts.size());
+}
 
+ggml_backend_buffer_type_t ggml_backend_meta_buffer_type(
+        ggml_backend_dev_t meta_device, ggml_backend_buffer_type_t const * simple_bufts, size_t n_simple_bufts) {
+    if (!ggml_backend_dev_is_meta(meta_device) || simple_bufts == nullptr || n_simple_bufts == 0 ||
+        n_simple_bufts != ggml_backend_meta_n_devices(meta_device)) {
+        return nullptr;
+    }
+    for (size_t index = 0; index < n_simple_bufts; ++index) {
+        if (simple_bufts[index] == nullptr) {
+            return nullptr;
+        }
+    }
+
+    using key_t = std::pair<ggml_backend_dev_t, std::vector<ggml_backend_buffer_type_t>>;
+    static std::vector<std::unique_ptr<ggml_backend_meta_buffer_type_context>> contexts;
+    static std::map<key_t, struct ggml_backend_buffer_type>                    meta_bufts;
+
+    key_t key = { meta_device, std::vector<ggml_backend_buffer_type_t>(simple_bufts, simple_bufts + n_simple_bufts) };
+    const auto found = meta_bufts.find(key);
+    if (found != meta_bufts.end()) {
+        return &found->second;
+    }
+
+    contexts.push_back(std::make_unique<ggml_backend_meta_buffer_type_context>(key.second));
     struct ggml_backend_buffer_type meta_buft = {
         /*iface  =*/ ggml_backend_meta_buffer_type_iface,
-        /*device =*/ dev,
-        /*ctx    =*/ buft_ctx,
+        /*device =*/ meta_device,
+        /*ctx    =*/ contexts.back().get(),
     };
-    auto result = meta_bufts.emplace(dev, meta_buft);
-    return &result.first->second;
+    return &meta_bufts.emplace(std::move(key), meta_buft).first->second;
 }
 
 static ggml_backend_buffer_type_t ggml_backend_meta_device_get_host_buffer_type(ggml_backend_dev_t dev) {
@@ -470,7 +495,7 @@ static ggml_backend_buffer_t ggml_backend_meta_buffer_simple_buffer(ggml_backend
     return buf_ctx->bufs[index].get();
 }
 
-static struct ggml_tensor * ggml_backend_meta_buffer_simple_tensor(const struct ggml_tensor * tensor, size_t index) {
+struct ggml_tensor * ggml_backend_meta_buffer_simple_tensor(const struct ggml_tensor * tensor, size_t index) {
     GGML_ASSERT(ggml_backend_buffer_is_meta(tensor->buffer));
     ggml_backend_meta_buffer_context * buf_ctx = (ggml_backend_meta_buffer_context *) tensor->buffer->context;
     GGML_ASSERT(index < buf_ctx->bufs.size());
@@ -481,6 +506,25 @@ static struct ggml_tensor * ggml_backend_meta_buffer_simple_tensor(const struct 
         return nullptr;
     }
     return it->second[index];
+}
+
+void ggml_backend_meta_tensor_set_adapter(
+        ggml_tensor * tensor,
+        ggml_backend_meta_tensor_adapter * adapter,
+        ggml_backend_meta_split_state split_state,
+        ggml_backend_meta_materialize_t materialize,
+        void * userdata) {
+    GGML_ASSERT(tensor != nullptr);
+    GGML_ASSERT(adapter != nullptr);
+    GGML_ASSERT(materialize != nullptr);
+
+    *adapter = {
+        GGML_BACKEND_META_TENSOR_ADAPTER_MAGIC,
+        split_state,
+        materialize,
+        userdata,
+    };
+    tensor->extra = adapter;
 }
 
 static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(const struct ggml_tensor * tensor,
@@ -786,6 +830,9 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
     auto calculate_split_state = [&]() -> ggml_backend_meta_split_state {
         if (ggml_nelements(tensor) == 0) {
             return {GGML_BACKEND_SPLIT_AXIS_UNKNOWN, {0}, {1}, 1};
+        }
+        if (const auto * adapter = ggml_backend_meta_tensor_get_adapter(tensor)) {
+            return adapter->split_state;
         }
         if (ggml_backend_buffer_get_usage(tensor->buffer) != GGML_BACKEND_BUFFER_USAGE_COMPUTE && tensor->view_src == nullptr) {
             ggml_backend_dev_t dev = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(tensor->buffer));
@@ -1218,6 +1265,13 @@ static enum ggml_status ggml_backend_meta_buffer_init_tensor_impl(ggml_backend_m
             }
         }
 
+        if (const auto * adapter = ggml_backend_meta_tensor_get_adapter(tensor)) {
+            const enum ggml_status status = adapter->materialize(simple_ctx, t_ij, j, adapter->userdata);
+            if (status != GGML_STATUS_SUCCESS) {
+                return status;
+            }
+        }
+
         simple_tensors.push_back(t_ij);
     }
 
@@ -1623,14 +1677,14 @@ struct ggml_backend_meta_context {
     ggml_backend_comm_allreduce_tensor_t comm_allreduce = nullptr;
 
     ggml_backend_meta_context(ggml_backend_dev_t meta_dev, const char * params) {
-        const size_t n_devs = ggml_backend_meta_dev_n_devs(meta_dev);
+        const size_t n_devs = ggml_backend_meta_n_devices(meta_dev);
         n_reduce_steps = std::ceil(std::log2(n_devs));
         name = "Meta(";
         std::vector<ggml_backend_t> simple_backends;
         backend_configs.reserve(n_devs);
         simple_backends.reserve(n_devs);
         for (size_t i = 0; i < n_devs; i++) {
-            ggml_backend_dev_t simple_dev = ggml_backend_meta_dev_simple_dev(meta_dev, i);
+            ggml_backend_dev_t simple_dev = ggml_backend_meta_simple_device(meta_dev, i);
             if (i > 0) {
                 name += ",";
             }

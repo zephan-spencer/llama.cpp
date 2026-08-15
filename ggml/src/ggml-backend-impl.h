@@ -92,8 +92,36 @@ extern "C" {
     GGML_API bool ggml_backend_buffer_is_meta(ggml_backend_buffer_t buf);
     GGML_API bool ggml_backend_buft_is_meta  (ggml_backend_buffer_type_t buft);
 
+    GGML_API size_t             ggml_backend_meta_n_devices    (ggml_backend_dev_t meta_device);
+    GGML_API ggml_backend_dev_t ggml_backend_meta_simple_device(ggml_backend_dev_t meta_device, size_t index);
     GGML_API size_t         ggml_backend_meta_n_backends    (ggml_backend_t meta_backend);
     GGML_API ggml_backend_t ggml_backend_meta_simple_backend(ggml_backend_t meta_backend, size_t index);
+
+    // Create a meta buffer type from one child buffer type per meta device.
+    GGML_API ggml_backend_buffer_type_t ggml_backend_meta_buffer_type(
+        ggml_backend_dev_t meta_device, ggml_backend_buffer_type_t const * simple_bufts, size_t n_simple_bufts);
+
+    // Return the child tensor created during meta buffer allocation.
+    GGML_API struct ggml_tensor * ggml_backend_meta_buffer_simple_tensor(const struct ggml_tensor * tensor, size_t index);
+
+    // Materialization runs after the meta backend creates a child tensor and maps its sources and view.
+    typedef enum ggml_status (*ggml_backend_meta_materialize_t)(
+        struct ggml_context * ctx, struct ggml_tensor * tensor, size_t index, void * userdata);
+
+    struct ggml_backend_meta_tensor_adapter {
+        uint64_t                             magic;
+        struct ggml_backend_meta_split_state split_state;
+        ggml_backend_meta_materialize_t      materialize;
+        void *                               userdata;
+    };
+
+    // The caller owns the adapter for the tensor lifetime.
+    GGML_API void ggml_backend_meta_tensor_set_adapter(
+        struct ggml_tensor * tensor,
+        struct ggml_backend_meta_tensor_adapter * adapter,
+        struct ggml_backend_meta_split_state split_state,
+        ggml_backend_meta_materialize_t materialize,
+        void * userdata);
 
     // temporary workaround to statically allocate tensors from a context in a deduplicated way:
     GGML_API struct ggml_backend_buffer * ggml_backend_meta_alloc_ctx_tensors_from_buft(struct ggml_context * ctx, ggml_backend_buffer_type_t buft);
