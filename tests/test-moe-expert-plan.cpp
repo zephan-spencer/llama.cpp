@@ -5,6 +5,7 @@
 
 #include <hip/hip_runtime_api.h>
 using cudaStream_t = hipStream_t;
+#include "expert-cache-policy.cuh"
 #include "mmid.cuh"
 
 #include <algorithm>
@@ -293,32 +294,40 @@ static void run_case(const test_case & test, hipStream_t stream) {
     resolve_active.set({ 0 });
     policy_flags.set({ 0 });
 
-    ggml_cuda_expert_plan plan  = {};
-    plan.ids_src                = ids_src.ptr;
-    plan.ids_dst                = ids_dst.ptr;
-    plan.expert_bounds          = expert_bounds.ptr;
-    plan.route_ids              = saved_route_ids.ptr;
-    plan.route_bounds           = saved_route_bounds.ptr;
-    plan.route_plan             = saved_route_plan.ptr;
-    plan.expert_order           = expert_order.ptr;
-    plan.fill_expert            = fill_expert.ptr;
-    plan.fill_slot              = fill_slot.ptr;
-    plan.cache_ids              = cache_ids.ptr;
-    plan.expert_to_cache        = expert_to_cache.ptr;
-    plan.cache_to_expert        = cache_to_expert.ptr;
-    plan.last_used              = last_used.ptr;
-    plan.protected_epoch        = protected_epoch.ptr;
-    plan.pending_priority_epoch = pending_priority_epoch.ptr;
-    plan.use_clock              = use_clock.ptr;
-    plan.token_priority         = token_priority.ptr;
-    plan.epoch                  = epoch.ptr;
-    plan.n_fill                 = n_fill.ptr;
-    plan.resolve_active         = resolve_active.ptr;
-    plan.policy_flags           = policy_flags.ptr;
+    ggml_cuda_expert_plan plan = {};
+    plan.ids_src               = ids_src.ptr;
+    plan.ids_dst               = ids_dst.ptr;
+    plan.expert_bounds         = expert_bounds.ptr;
+
+    ggml_cuda_expert_selector_plan selectors = {};
+    selectors.route_ids         = saved_route_ids.ptr;
+    selectors.route_bounds      = saved_route_bounds.ptr;
+    selectors.route_plan        = saved_route_plan.ptr;
+    selectors.route_tile_bounds = saved_route_tile_bounds.ptr;
+    selectors.expert_order      = expert_order.ptr;
+    selectors.selectors         = cache_ids.ptr;
+
+    ggml_cuda_expert_cache_policy_state policy = {};
+    policy.fill_expert            = fill_expert.ptr;
+    policy.fill_slot              = fill_slot.ptr;
+    policy.expert_to_cache        = expert_to_cache.ptr;
+    policy.cache_to_expert        = cache_to_expert.ptr;
+    policy.last_used              = last_used.ptr;
+    policy.protected_epoch        = protected_epoch.ptr;
+    policy.pending_priority_epoch = pending_priority_epoch.ptr;
+    policy.use_clock              = use_clock.ptr;
+    policy.epoch                  = epoch.ptr;
+    policy.n_fill                 = n_fill.ptr;
+    policy.resolve_active         = resolve_active.ptr;
+    policy.policy_flags           = policy_flags.ptr;
 
     ggml_cuda_launch_expert_plan(ids.ptr, plan, test.n_expert, test.n_tokens, test.n_expert_used, test.n_expert_used,
-                                 test.n_expert_used, test.n_expert_used, false, test.n_cache, stream);
-    hip_check(hipGetLastError(), "ggml_cuda_launch_expert_plan");
+                                 test.n_expert_used, test.n_expert_used, false, stream);
+    ggml_cuda_launch_expert_cache_selectors(ids.ptr, selectors, policy.expert_to_cache, token_priority.ptr,
+                                            policy.resolve_active, policy.policy_flags, test.n_expert, test.n_tokens,
+                                            test.n_expert_used, stream);
+    ggml_cuda_apply_expert_cache_policy(selectors, policy, test.n_expert, test.n_cache, stream);
+    hip_check(hipGetLastError(), "expert plan launch");
     constexpr int route_tile_width = 4;
     ggml_cuda_launch_expert_route_tiles(saved_route_bounds.ptr, saved_route_tile_bounds.ptr, test.n_expert,
                                         route_tile_width, stream);
@@ -393,25 +402,26 @@ static void run_deferred_priority_case(hipStream_t stream) {
     device_buffer<uint32_t>                    resolve_active(1);
     device_buffer<uint32_t>                    policy_flags(1);
 
-    ggml_cuda_expert_plan plan  = {};
-    plan.fill_expert            = fill_expert.ptr;
-    plan.fill_slot              = fill_slot.ptr;
-    plan.cache_ids              = cache_ids.ptr;
-    plan.route_ids              = route_ids.ptr;
-    plan.route_bounds           = route_bounds.ptr;
-    plan.route_plan             = route_plan.ptr;
-    plan.expert_order           = expert_order.ptr;
-    plan.expert_to_cache        = expert_to_cache.ptr;
-    plan.cache_to_expert        = cache_to_expert.ptr;
-    plan.last_used              = last_used.ptr;
-    plan.protected_epoch        = protected_epoch.ptr;
-    plan.pending_priority_epoch = pending_priority_epoch.ptr;
-    plan.use_clock              = use_clock.ptr;
-    plan.token_priority         = priority.ptr;
-    plan.epoch                  = epoch.ptr;
-    plan.n_fill                 = n_fill.ptr;
-    plan.resolve_active         = resolve_active.ptr;
-    plan.policy_flags           = policy_flags.ptr;
+    ggml_cuda_expert_selector_plan selectors = {};
+    selectors.selectors    = cache_ids.ptr;
+    selectors.route_ids    = route_ids.ptr;
+    selectors.route_bounds = route_bounds.ptr;
+    selectors.route_plan   = route_plan.ptr;
+    selectors.expert_order = expert_order.ptr;
+
+    ggml_cuda_expert_cache_policy_state policy = {};
+    policy.fill_expert            = fill_expert.ptr;
+    policy.fill_slot              = fill_slot.ptr;
+    policy.expert_to_cache        = expert_to_cache.ptr;
+    policy.cache_to_expert        = cache_to_expert.ptr;
+    policy.last_used              = last_used.ptr;
+    policy.protected_epoch        = protected_epoch.ptr;
+    policy.pending_priority_epoch = pending_priority_epoch.ptr;
+    policy.use_clock              = use_clock.ptr;
+    policy.epoch                  = epoch.ptr;
+    policy.n_fill                 = n_fill.ptr;
+    policy.resolve_active         = resolve_active.ptr;
+    policy.policy_flags           = policy_flags.ptr;
 
     auto reset = [&] {
         expert_to_cache.set({ 0, 1, -1 });
@@ -432,7 +442,10 @@ static void run_deferred_priority_case(hipStream_t stream) {
         ids.set(ids_data);
         priority.set(priority_data);
         epoch.set({ route_epoch });
-        ggml_cuda_launch_expert_cache_plan(ids.ptr, plan, n_expert, route_ids.size(), 1, n_cache, stream);
+        ggml_cuda_launch_expert_cache_selectors(ids.ptr, selectors, policy.expert_to_cache, priority.ptr,
+                                                policy.resolve_active, policy.policy_flags, n_expert, route_ids.size(),
+                                                1, stream);
+        ggml_cuda_apply_expert_cache_policy(selectors, policy, n_expert, n_cache, stream);
         hip_check(hipGetLastError(), "deferred priority launch");
         hip_check(hipStreamSynchronize(stream), "deferred priority synchronize");
     };

@@ -2,6 +2,7 @@
 #include "expert-cache.cuh"
 #include "ggml-cuda.h"
 #include "ggml-impl.h"
+#include "expert-cache-policy.cuh"
 #include "mmid.cuh"
 
 #include <algorithm>
@@ -342,37 +343,43 @@ void ggml_cuda_expert_cache(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
     uint8_t * state_data = static_cast<uint8_t *>(dst->src[state_index]->data);
     auto *    header     = reinterpret_cast<ggml_backend_cuda_expert_cache_state *>(state_data);
 
-    ggml_cuda_expert_plan plan = {};
-    plan.fill_expert           = reinterpret_cast<int32_t *>(state_data + params.fill_expert_offset);
-    plan.fill_slot             = reinterpret_cast<int32_t *>(state_data + params.fill_slot_offset);
-    const auto route_layout    = ggml_cuda_expert_cache_route_layout(params.n_routes, desc->n_expert);
-    plan.cache_ids = reinterpret_cast<int32_t *>(static_cast<uint8_t *>(dst->data) + route_layout.selectors_offset);
-    const size_t n_routes = params.n_routes;
-    plan.route_ids = reinterpret_cast<int32_t *>(static_cast<uint8_t *>(dst->data) + route_layout.route_ids_offset);
-    plan.route_bounds =
+    const auto route_layout = ggml_cuda_expert_cache_route_layout(params.n_routes, desc->n_expert);
+
+    ggml_cuda_expert_selector_plan selectors = {};
+    selectors.selectors =
+        reinterpret_cast<int32_t *>(static_cast<uint8_t *>(dst->data) + route_layout.selectors_offset);
+    selectors.route_ids =
+        reinterpret_cast<int32_t *>(static_cast<uint8_t *>(dst->data) + route_layout.route_ids_offset);
+    selectors.route_bounds =
         reinterpret_cast<int32_t *>(static_cast<uint8_t *>(dst->data) + route_layout.route_bounds_offset);
-    plan.route_plan = reinterpret_cast<ggml_cuda_expert_route_plan *>(static_cast<uint8_t *>(dst->data) +
-                                                                      route_layout.route_plan_offset);
-    plan.expert_order =
+    selectors.route_plan = reinterpret_cast<ggml_cuda_expert_route_plan *>(static_cast<uint8_t *>(dst->data) +
+                                                                           route_layout.route_plan_offset);
+    selectors.expert_order =
         reinterpret_cast<int32_t *>(static_cast<uint8_t *>(dst->data) + route_layout.active_experts_offset);
-    plan.route_tile_bounds =
+    selectors.route_tile_bounds =
         reinterpret_cast<int32_t *>(static_cast<uint8_t *>(dst->data) + route_layout.route_tile_bounds_offset);
-    plan.expert_to_cache        = reinterpret_cast<int32_t *>(state_data + params.expert_to_cache_offset);
-    plan.cache_to_expert        = reinterpret_cast<int32_t *>(state_data + params.cache_to_expert_offset);
-    plan.last_used              = reinterpret_cast<uint64_t *>(state_data + params.last_used_offset);
-    plan.protected_epoch        = reinterpret_cast<uint64_t *>(state_data + params.protected_epoch_offset);
-    plan.pending_priority_epoch = reinterpret_cast<uint64_t *>(state_data + params.pending_priority_epoch_offset);
-    plan.token_priority         = static_cast<const int32_t *>(dst->src[priority_index]->data);
-    plan.epoch                  = static_cast<const int32_t *>(dst->src[epoch_index]->data);
-    plan.use_clock              = &header->use_clock;
-    plan.n_fill                 = &header->n_fills;
-    plan.resolve_active         = &header->resolve_active;
-    plan.policy_flags           = &header->policy_flags;
+
+    ggml_cuda_expert_cache_policy_state policy = {};
+    policy.fill_expert = reinterpret_cast<int32_t *>(state_data + params.fill_expert_offset);
+    policy.fill_slot   = reinterpret_cast<int32_t *>(state_data + params.fill_slot_offset);
+    policy.expert_to_cache        = reinterpret_cast<int32_t *>(state_data + params.expert_to_cache_offset);
+    policy.cache_to_expert        = reinterpret_cast<int32_t *>(state_data + params.cache_to_expert_offset);
+    policy.last_used              = reinterpret_cast<uint64_t *>(state_data + params.last_used_offset);
+    policy.protected_epoch        = reinterpret_cast<uint64_t *>(state_data + params.protected_epoch_offset);
+    policy.pending_priority_epoch = reinterpret_cast<uint64_t *>(state_data + params.pending_priority_epoch_offset);
+    policy.epoch                  = static_cast<const int32_t *>(dst->src[epoch_index]->data);
+    policy.use_clock              = &header->use_clock;
+    policy.n_fill                 = &header->n_fills;
+    policy.resolve_active         = &header->resolve_active;
+    policy.policy_flags           = &header->policy_flags;
 
     const int n_expert_used = dst->src[0]->ne[0];
     const int n_tokens      = ggml_nelements(dst->src[0]) / n_expert_used;
-    ggml_cuda_launch_expert_cache_plan(static_cast<const int32_t *>(dst->src[0]->data), plan, desc->n_expert, n_tokens,
-                                       n_expert_used, desc->n_cache, ctx.stream());
+    ggml_cuda_launch_expert_cache_selectors(
+        static_cast<const int32_t *>(dst->src[0]->data), selectors, policy.expert_to_cache,
+        static_cast<const int32_t *>(dst->src[priority_index]->data), policy.resolve_active, policy.policy_flags,
+        desc->n_expert, n_tokens, n_expert_used, ctx.stream());
+    ggml_cuda_apply_expert_cache_policy(selectors, policy, desc->n_expert, desc->n_cache, ctx.stream());
     CUDA_CHECK(cudaGetLastError());
 
     expert_cache_copy_kernel<<<32, 256, 0, ctx.stream()>>>(state_data, params);

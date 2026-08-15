@@ -218,7 +218,7 @@ void ggml_cuda_mul_mat_q(
         plan.ids_dst = ids_dst.get();
         plan.expert_bounds = expert_bounds.get();
         ggml_cuda_launch_expert_plan((const int32_t *) ids->data, plan,
-            n_experts, ne12, n_expert_used, ne11, si1, sis1, /*write_inverse =*/ dedup_bcast, /*n_cache =*/ 0, stream);
+            n_experts, ne12, n_expert_used, ne11, si1, sis1, /*write_inverse =*/ dedup_bcast, stream);
         CUDA_CHECK(cudaGetLastError());
     }
 
