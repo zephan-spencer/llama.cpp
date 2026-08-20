@@ -22,7 +22,7 @@ Options:
   --main-gpu INDEX           logical visible GPU for small/intermediate tensors (default: 0)
   --cache-sizes LIST         comma-separated cache sizes (default: 32,64,128,196,255)
   --prompt TOKENS            prompt length (default: 16384; use 0 to disable)
-  --generation TOKENS        generated tokens (default: 128; use 0 to disable)
+  --generation TOKENS        generated tokens (default: 1024; use 0 to disable)
   --batch-size TOKENS        logical batch size (default: 4096)
   --ubatch-size TOKENS       physical ubatch size (default: 4096)
   --repetitions N            repetitions per benchmark (default: 5)
@@ -74,7 +74,7 @@ tensor_split=''
 main_gpu=0
 cache_sizes='32,64,128,196,255'
 prompt_tokens=16384
-generation_tokens=128
+generation_tokens=1024
 batch_size=4096
 ubatch_size=4096
 repetitions=5
