@@ -1054,6 +1054,8 @@ struct llm_graph_context {
     ggml_context * ctx0 = nullptr;
     ggml_cgraph  * gf   = nullptr;
     mutable ggml_tensor * output_priority = nullptr;
+    mutable ggml_tensor * output_ids = nullptr;
+    mutable ggml_tensor * output_route_priority = nullptr;
     mutable ggml_tensor * moe_cache_epoch = nullptr;
 
     llm_graph_context(const llm_graph_params & params);
@@ -1174,7 +1176,7 @@ struct llm_graph_context {
     ggml_tensor * build_inp_pos() const;
     ggml_tensor * build_inp_attn_scale() const;
     ggml_tensor * build_inp_out_ids() const;
-    std::pair<ggml_tensor *, ggml_tensor *> build_inp_moe_cache() const;
+    std::pair<ggml_tensor *, ggml_tensor *> build_inp_moe_cache(int64_t n_route_tokens) const;
     ggml_tensor * build_inp_mean() const;
     ggml_tensor * build_inp_cls() const;
 

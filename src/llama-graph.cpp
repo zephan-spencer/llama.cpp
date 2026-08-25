@@ -2134,7 +2134,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         /*.ids     =*/ selected_experts,
     };
     if (moe_cache != nullptr) {
-        const auto [token_priority, epoch] = build_inp_moe_cache();
+        const auto [token_priority, epoch] = build_inp_moe_cache(selected_experts->ne[1]);
         cache_binding = moe_cache->bind(
             ctx0, sched, il, selected_experts, token_priority, epoch,
             up_exps, gate_exps, down_exps, gate_up_exps);
@@ -2474,28 +2474,42 @@ ggml_tensor * llm_graph_context::build_inp_out_ids() const {
 
     cur = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_outputs);
     ggml_set_input(cur);
+    output_ids = cur;
 
     res->add_input(std::move(inp));
 
     return cur;
 }
 
-std::pair<ggml_tensor *, ggml_tensor *> llm_graph_context::build_inp_moe_cache() const {
+std::pair<ggml_tensor *, ggml_tensor *> llm_graph_context::build_inp_moe_cache(int64_t n_route_tokens) const {
     GGML_ASSERT(moe_cache != nullptr);
-    if (output_priority != nullptr) {
+    if (output_priority == nullptr) {
+        auto inp = std::make_unique<llm_graph_input_moe_cache>(moe_cache);
+        inp->priority = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, ubatch.n_tokens);
+        inp->epoch = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, 1);
+        ggml_set_input(inp->priority);
+        ggml_set_input(inp->epoch);
+
+        output_priority = inp->priority;
+        moe_cache_epoch = inp->epoch;
+        res->add_input(std::move(inp));
+    }
+
+    if (n_route_tokens == ubatch.n_tokens) {
         return { output_priority, moe_cache_epoch };
     }
 
-    auto inp = std::make_unique<llm_graph_input_moe_cache>(moe_cache);
-    inp->priority = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, ubatch.n_tokens);
-    inp->epoch = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, 1);
-    ggml_set_input(inp->priority);
-    ggml_set_input(inp->epoch);
+    if (n_route_tokens != n_outputs || output_ids == nullptr) {
+        throw std::runtime_error("MoE expert cache: cannot map priorities to routed tokens");
+    }
 
-    output_priority = inp->priority;
-    moe_cache_epoch = inp->epoch;
-    res->add_input(std::move(inp));
-    return { output_priority, moe_cache_epoch };
+    if (output_route_priority == nullptr) {
+        ggml_tensor * priority_rows = ggml_reshape_2d(ctx0, output_priority, 1, ubatch.n_tokens);
+        output_route_priority = ggml_get_rows(ctx0, priority_rows, output_ids);
+        output_route_priority = ggml_reshape_1d(ctx0, output_route_priority, n_outputs);
+    }
+
+    return { output_route_priority, moe_cache_epoch };
 }
 
 ggml_tensor * llm_graph_context::build_inp_mean() const {
