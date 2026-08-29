@@ -1177,7 +1177,7 @@ struct ggml_tensor * llama_model_loader::create_tensor(
 
         ggml_backend_buffer_type_t buft = nullptr;
         const bool moe_cache_weight = n_moe_cache_experts > 0 &&
-            llama_moe_cache_supports_weight(t_meta) &&
+            tn.bid >= 0 && static_cast<uint32_t>(tn.bid) < hparams.n_layer() &&
             llama_moe_cache_is_routed_weight(tn.tensor, tn.suffix);
 
         // check overrides
@@ -1216,8 +1216,12 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         if (moe_cache_weight) {
             const ggml_backend_dev_t         target = buft_list->front().first;
             const ggml_backend_moe_cache_i * api    = ggml_backend_moe_cache_get_interface(target);
-            buft = api != nullptr ? api->get_source_buffer_type(target) : nullptr;
-            if (!buft) {
+            if (api == nullptr || !api->supports_weight(target, t_meta)) {
+                throw std::runtime_error(
+                    "MoE expert cache: backend does not support routed expert weight " + tn.str());
+            }
+            buft = api->get_source_buffer_type(target);
+            if (buft == nullptr) {
                 throw std::runtime_error(
                     "MoE expert cache: failed to find a host buffer type for " + tn.str());
             }

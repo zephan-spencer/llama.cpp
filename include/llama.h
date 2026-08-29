@@ -214,6 +214,10 @@ extern "C" {
     LLAMA_API const char * llama_load_mode_name(enum llama_load_mode load_mode);
     LLAMA_API enum llama_load_mode llama_load_mode_from_str(const char * str);
 
+    enum llama_moe_cache_policy {
+        LLAMA_MOE_CACHE_POLICY_LRU = 0,
+    };
+
     enum llama_context_type {
         LLAMA_CONTEXT_TYPE_DEFAULT = 0,
         LLAMA_CONTEXT_TYPE_MTP     = 1,
@@ -312,7 +316,6 @@ extern "C" {
         const struct llama_model_tensor_buft_override * tensor_buft_overrides;
 
         int32_t n_gpu_layers; // number of layers to store in VRAM, a negative value means all layers
-        uint32_t n_moe_cache_experts; // number of routed experts to cache per MoE layer
         enum llama_split_mode split_mode; // how to split the model across multiple GPUs
         enum llama_load_mode  load_mode;  // how to load the model
 
@@ -340,6 +343,9 @@ extern "C" {
         bool no_host;         // bypass host buffer allowing extra buffers to be used
         bool no_alloc;        // only load metadata and simulate memory allocations
         bool load_mtp;        // whether to load MTP layers
+
+        uint32_t                    n_moe_cache_experts; // number of routed experts to cache per MoE layer
+        enum llama_moe_cache_policy moe_cache_policy;   // expert cache residency policy
     };
 
     struct llama_sampler_seq_config {

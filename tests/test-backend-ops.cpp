@@ -18,6 +18,7 @@
 #include "ggml.h"
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
+#include "ggml-backend-moe-cache.h"
 #include "ggml-cpp.h"
 
 #include <algorithm>
@@ -10668,6 +10669,158 @@ static bool run_fa_vec_slice(ggml_backend_t backend, ggml_backend_t backend_cpu,
     return n_fail == 0;
 }
 
+static bool run_moe_cache_case(ggml_backend_t backend, const ggml_backend_moe_cache_i * api, ggml_type type) {
+    constexpr int64_t n_columns = 256;
+    constexpr int64_t n_rows    = 8;
+    constexpr int64_t n_experts = 8;
+    constexpr int64_t n_cache   = 3;
+    constexpr int64_t n_used    = 4;
+    constexpr int64_t n_tokens  = 1;
+
+    ggml_backend_dev_t device = ggml_backend_get_device(backend);
+
+    ggml_init_params params = {
+        /* .mem_size = */ 4 * 1024 * 1024,
+        /* .mem_base = */ nullptr,
+        /* .no_alloc = */ true,
+    };
+    ggml_context_ptr source_ctx(ggml_init(params));
+    ggml_context_ptr owner_ctx(ggml_init(params));
+    ggml_context_ptr graph_ctx(ggml_init(params));
+    GGML_ASSERT(source_ctx && owner_ctx && graph_ctx);
+
+    ggml_tensor * source = ggml_new_tensor_3d(source_ctx.get(), type, n_columns, n_rows, n_experts);
+    if (!api->supports_weight(device, source)) {
+        return true;
+    }
+
+    ggml_backend_buffer_type_t source_buft = api->get_source_buffer_type(device);
+    ggml_backend_buffer_ptr source_buf(ggml_backend_alloc_ctx_tensors_from_buft(source_ctx.get(), source_buft));
+    if (!source_buf) {
+        printf("  MOE_CACHE(type=%s): source allocation failed\n", ggml_type_name(type));
+        return false;
+    }
+    ggml_backend_buffer_set_usage(source_buf.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+
+    const size_t state_size = api->get_state_size(
+        device, GGML_BACKEND_MOE_CACHE_POLICY_LRU, n_experts, n_cache, 1);
+    if (state_size == 0) {
+        printf("  MOE_CACHE(type=%s): invalid state size\n", ggml_type_name(type));
+        return false;
+    }
+
+    ggml_tensor * state = ggml_new_tensor_1d(owner_ctx.get(), GGML_TYPE_I8, state_size);
+    ggml_tensor * slots = ggml_new_tensor_3d(owner_ctx.get(), type, n_columns, n_rows, n_cache);
+    ggml_tensor * full  = ggml_new_tensor_3d(owner_ctx.get(), type, n_columns, n_rows, n_experts);
+    ggml_tensor * input = ggml_new_tensor_3d(owner_ctx.get(), GGML_TYPE_F32, n_columns, n_used, n_tokens);
+    ggml_tensor * ids   = ggml_new_tensor_2d(owner_ctx.get(), GGML_TYPE_I32, n_used, n_tokens);
+
+    ggml_backend_buffer_ptr owner_buf(ggml_backend_alloc_ctx_tensors(owner_ctx.get(), backend));
+    if (!owner_buf) {
+        printf("  MOE_CACHE(type=%s): device allocation failed\n", ggml_type_name(type));
+        return false;
+    }
+
+    init_tensor_uniform(source, -0.5f, 0.5f);
+    std::vector<uint8_t> quantized(ggml_nbytes(source));
+    ggml_backend_tensor_get(source, quantized.data(), 0, quantized.size());
+    ggml_backend_tensor_set(full, quantized.data(), 0, quantized.size());
+
+    std::vector<float> input_data(ggml_nelements(input));
+    for (size_t i = 0; i < input_data.size(); ++i) {
+        input_data[i] = float(int(i % 17) - 8) / 8.0f;
+    }
+    ggml_backend_tensor_set(input, input_data.data(), 0, input_data.size() * sizeof(float));
+
+    ggml_tensor * sources[] = { source };
+    ggml_tensor * caches[]  = { slots };
+    ggml_backend_moe_cache_t cache = api->create(
+        backend, state, sources, caches, GGML_BACKEND_MOE_CACHE_POLICY_LRU, n_experts, n_cache, 1);
+    if (!cache) {
+        printf("  MOE_CACHE(type=%s): cache creation failed\n", ggml_type_name(type));
+        return false;
+    }
+
+    const ggml_backend_moe_cache_plan plan = api->build_plan(cache, graph_ctx.get(), ids);
+    if (!plan.execution || !plan.selectors) {
+        api->destroy(cache);
+        printf("  MOE_CACHE(type=%s): plan creation failed\n", ggml_type_name(type));
+        return false;
+    }
+
+    ggml_tensor * cached_out = ggml_mul_mat_id(graph_ctx.get(), slots, input, ids);
+    cached_out->src[3]        = plan.selectors;
+    ggml_tensor * full_out    = ggml_mul_mat_id(graph_ctx.get(), full, input, ids);
+
+    ggml_cgraph * graph = ggml_new_graph(graph_ctx.get());
+    ggml_build_forward_expand(graph, cached_out);
+    ggml_build_forward_expand(graph, full_out);
+
+    ggml_backend_buffer_ptr graph_buf(ggml_backend_alloc_ctx_tensors(graph_ctx.get(), backend));
+    if (!graph_buf) {
+        api->destroy(cache);
+        printf("  MOE_CACHE(type=%s): graph allocation failed\n", ggml_type_name(type));
+        return false;
+    }
+
+    struct route_case {
+        std::array<int32_t, n_used> ids;
+        std::array<int32_t, n_used> selectors;
+    };
+    const route_case cases[] = {
+        { { 5, 2, 7, 1 }, {  0, 1, 2, -2 } },
+        { { 5, 1, 5, 1 }, {  0, 1, 0,  1 } },
+        { { 2, 7, 2, 7 }, {  0, 2, 0,  2 } },
+    };
+
+    bool ok = true;
+    for (const route_case & test : cases) {
+        ggml_backend_tensor_set(ids, test.ids.data(), 0, sizeof(test.ids));
+        if (ggml_backend_graph_compute(backend, graph) != GGML_STATUS_SUCCESS) {
+            ok = false;
+            break;
+        }
+
+        std::array<int32_t, n_used> selectors;
+        ggml_backend_tensor_get(plan.selectors, selectors.data(), 0, sizeof(selectors));
+        if (selectors != test.selectors) {
+            ok = false;
+            break;
+        }
+
+        std::vector<float> cached_data(ggml_nelements(cached_out));
+        std::vector<float> full_data(ggml_nelements(full_out));
+        ggml_backend_tensor_get(cached_out, cached_data.data(), 0, cached_data.size() * sizeof(float));
+        ggml_backend_tensor_get(full_out, full_data.data(), 0, full_data.size() * sizeof(float));
+        if (nmse(cached_data.data(), full_data.data(), cached_data.size()) > 1e-7) {
+            ok = false;
+            break;
+        }
+    }
+
+    api->destroy(cache);
+    printf("  MOE_CACHE(type=%s): %s\n", ggml_type_name(type), ok ? "OK" : "FAIL");
+    return ok;
+}
+
+static bool run_moe_cache_slice(ggml_backend_t backend, const char * op_names_filter) {
+    if (!op_names_filter_selects(op_names_filter, "MUL_MAT_ID")) {
+        return true;
+    }
+
+    ggml_backend_dev_t device = ggml_backend_get_device(backend);
+    const ggml_backend_moe_cache_i * api = ggml_backend_moe_cache_get_interface(device);
+    if (!api) {
+        return true;
+    }
+
+    bool ok = true;
+    for (ggml_type type : { GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_MXFP4 }) {
+        ok = run_moe_cache_case(backend, api, type) && ok;
+    }
+    return ok;
+}
+
 static bool test_backend(ggml_backend_t backend, ggml_backend_dev_t dev, test_mode mode, const char * op_names_filter, const char * params_filter,
                          printer * output_printer, const char * test_file_path, int parallel_workers) {
     auto filter_test_cases = [](std::vector<std::unique_ptr<test_case>> & test_cases, const char * params_filter) {
@@ -10805,9 +10958,10 @@ static bool test_backend(ggml_backend_t backend, ggml_backend_dev_t dev, test_mo
         output_printer->print_summary(test_summary_info(n_ok, tests_run, false));
         output_printer->print_failed_tests(failed_tests);
 
-        const bool slice_ok = run_fa_vec_slice(backend, backend_cpu.get(), op_names_filter);
+        const bool slice_ok     = run_fa_vec_slice(backend, backend_cpu.get(), op_names_filter);
+        const bool moe_cache_ok = run_moe_cache_slice(backend, op_names_filter);
 
-        return n_ok == tests_run && slice_ok;
+        return n_ok == tests_run && slice_ok && moe_cache_ok;
     }
 
     if (mode == MODE_GRAD) {

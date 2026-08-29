@@ -1846,6 +1846,10 @@ uint32_t llama_model::n_moe_cache_experts() const {
     return params.n_moe_cache_experts;
 }
 
+llama_moe_cache_policy llama_model::moe_cache_policy() const {
+    return params.moe_cache_policy;
+}
+
 llama_split_mode llama_model::split_mode() const {
     return params.split_mode;
 }
@@ -2633,7 +2637,6 @@ llama_model_params llama_model_default_params() {
         /*.devices                     =*/ nullptr,
         /*.tensor_buft_overrides       =*/ nullptr,
         /*.n_gpu_layers                =*/ -1,
-        /*.n_moe_cache_experts         =*/ 0,
         /*.split_mode                  =*/ LLAMA_SPLIT_MODE_LAYER,
         /*.load_mode                   =*/ LLAMA_LOAD_MODE_AUTO,
         /*.main_gpu                    =*/ 0,
@@ -2647,6 +2650,8 @@ llama_model_params llama_model_default_params() {
         /*.no_host                     =*/ false,
         /*.no_alloc                    =*/ false,
         /*.load_mtp                    =*/ false,
+        /*.n_moe_cache_experts         =*/ 0,
+        /*.moe_cache_policy            =*/ LLAMA_MOE_CACHE_POLICY_LRU,
     };
 
     return result;

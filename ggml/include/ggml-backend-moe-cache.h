@@ -8,6 +8,10 @@ extern "C" {
 
     typedef struct ggml_backend_moe_cache * ggml_backend_moe_cache_t;
 
+    enum ggml_backend_moe_cache_policy {
+        GGML_BACKEND_MOE_CACHE_POLICY_LRU = 0,
+    };
+
     #define GGML_BACKEND_MOE_CACHE_MAX_WEIGHTS 4
 
     struct ggml_backend_moe_cache_plan {
@@ -25,13 +29,20 @@ extern "C" {
     };
 
     struct ggml_backend_moe_cache_i {
+        bool (*supports_weight)(ggml_backend_dev_t device, const struct ggml_tensor * tensor);
         ggml_backend_buffer_type_t (*get_source_buffer_type)(ggml_backend_dev_t device);
-        size_t (*get_state_size)(ggml_backend_dev_t device, uint32_t n_expert, uint32_t n_cache, uint32_t n_weights);
+        size_t (*get_state_size)(
+            ggml_backend_dev_t device,
+            enum ggml_backend_moe_cache_policy policy,
+            uint32_t n_expert,
+            uint32_t n_cache,
+            uint32_t n_weights);
         ggml_backend_moe_cache_t (*create)(
             ggml_backend_t backend,
             struct ggml_tensor * state,
             struct ggml_tensor * const * source,
             struct ggml_tensor * const * slots,
+            enum ggml_backend_moe_cache_policy policy,
             uint32_t n_expert,
             uint32_t n_cache,
             uint32_t n_weights);
@@ -43,9 +54,7 @@ extern "C" {
         struct ggml_backend_moe_cache_plan (*build_plan)(
             ggml_backend_moe_cache_t cache,
             struct ggml_context * ctx,
-            struct ggml_tensor * logical_ids,
-            struct ggml_tensor * token_priority,
-            struct ggml_tensor * epoch);
+            struct ggml_tensor * logical_ids);
     };
 
     typedef const struct ggml_backend_moe_cache_i * (*ggml_backend_moe_cache_get_interface_t)(void);

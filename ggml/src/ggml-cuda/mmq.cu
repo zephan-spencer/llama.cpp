@@ -1,4 +1,5 @@
 #include "common.cuh"
+#include "expert-cache-route.cuh"
 #include "mmq.cuh"
 #include "quantize.cuh"
 #include "mmid.cuh"
@@ -81,7 +82,7 @@ static void ggml_cuda_mul_mat_q_switch_type(ggml_backend_cuda_context & ctx, con
     }
 }
 
-void ggml_cuda_mul_mat_q(
+static void ggml_cuda_mul_mat_q_impl(
         ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
         const ggml_cuda_expert_source_view * source) {
     GGML_ASSERT(        src1->type == GGML_TYPE_F32);
@@ -202,7 +203,7 @@ void ggml_cuda_mul_mat_q(
         // The cache planner has already produced the route order and expert
         // boundaries for this physical batch.  Only derive the input index
         // needed by this projection; do not regroup the routes.
-        ggml_cuda_launch_expert_plan_input_index(
+        ggml_cuda_launch_expert_cache_input_index(
             source->route_ids, ids_src1.get(), static_cast<int>(ne_get_rows),
             static_cast<int>(n_expert_used), static_cast<int>(ne11),
             static_cast<int>(sis1), dedup_bcast, stream);
@@ -213,12 +214,9 @@ void ggml_cuda_mul_mat_q(
 
         const int si1 = ids->nb[1] / ggml_element_size(ids);
 
-        ggml_cuda_expert_plan plan = {};
-        plan.ids_src = ids_src1.get();
-        plan.ids_dst = ids_dst.get();
-        plan.expert_bounds = expert_bounds.get();
-        ggml_cuda_launch_expert_plan((const int32_t *) ids->data, plan,
-            n_experts, ne12, n_expert_used, ne11, si1, sis1, /*write_inverse =*/ dedup_bcast, stream);
+        ggml_cuda_launch_mm_ids_helper((const int32_t *) ids->data, ids_src1.get(), ids_dst.get(),
+            expert_bounds.get(), n_experts, ne12, n_expert_used, ne11, si1, sis1,
+            /*write_inverse =*/ dedup_bcast, stream);
         CUDA_CHECK(cudaGetLastError());
     }
 
@@ -283,6 +281,18 @@ void ggml_cuda_mul_mat_q(
         source != nullptr ? ne_get_rows : ne12};
 
     ggml_cuda_mul_mat_q_switch_type(ctx, args, stream);
+}
+
+void ggml_cuda_mul_mat_q(
+        ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1,
+        const ggml_tensor * ids, ggml_tensor * dst) {
+    ggml_cuda_mul_mat_q_impl(ctx, src0, src1, ids, dst, nullptr);
+}
+
+void ggml_cuda_mul_mat_q_moe_cache(
+        ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1,
+        const ggml_tensor * ids, ggml_tensor * dst, const ggml_cuda_expert_source_view & source) {
+    ggml_cuda_mul_mat_q_impl(ctx, src0, src1, ids, dst, &source);
 }
 
 bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t n_experts) {

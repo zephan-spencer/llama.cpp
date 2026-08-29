@@ -1,6 +1,7 @@
 #pragma once
 
 #include "common.cuh"
+#include "expert-cache-route.cuh"
 #include "mmid.cuh"
 
 #include <algorithm>
@@ -945,7 +946,7 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
 
 // The mul_mat_q kernel implements "stream-k" work partitioning as described in https://arxiv.org/abs/2301.03598
 
-template <ggml_type type, int J, bool fallback>
+template <ggml_type type, int J, bool fallback, bool use_cache_source>
 __launch_bounds__(ggml_cuda_mmq_get_nthreads(type, J, fallback), ggml_cuda_mmq_get_occupancy(type, J, fallback))
 static __global__ void mul_mat_q(
         const char * __restrict__ x, const int * __restrict__ y, const int32_t * __restrict__ ids_dst,
@@ -1072,7 +1073,7 @@ static __global__ void mul_mat_q(
         const char * x_base = x;
         int x_stride = stride_channel_x;
         int x_channel = fastdiv(zt, channel_ratio);
-        if (source_ids != nullptr) {
+        if constexpr (use_cache_source) {
             const int route = ids_dst[col_low];
             const int source_route = (route / source_ids_width) * source_ids_stride + route % source_ids_width;
             const int source_id = source_ids[source_route];
@@ -1179,7 +1180,7 @@ static __global__ void mul_mat_q(
         const char * x_base = x;
         int x_stride = stride_channel_x;
         int x_channel = fastdiv(zt, channel_ratio);
-        if (source_ids != nullptr) {
+        if constexpr (use_cache_source) {
             const int route = ids_dst[col_low];
             const int source_route = (route / source_ids_width) * source_ids_stride + route % source_ids_width;
             const int source_id = source_ids[source_route];
@@ -1276,7 +1277,7 @@ static __global__ void mul_mat_q(
     const char * x_base = x;
     int x_stride = stride_channel_x;
     int x_channel = fastdiv(zt, channel_ratio);
-    if (source_ids != nullptr) {
+    if constexpr (use_cache_source) {
         const int route = ids_dst[col_low];
         const int source_route = (route / source_ids_width) * source_ids_stride + route % source_ids_width;
         const int source_id = source_ids[source_route];
@@ -1466,7 +1467,7 @@ static int64_t mmq_expert_route_tile_upper_bound(
     return (n_routes - 1)/routes_per_tile + 1 + std::min(n_experts, n_routes) - 1;
 }
 
-template <ggml_type type, int J, bool fallback>
+template <ggml_type type, int J, bool fallback, bool use_cache_source>
 static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream) {
     const int id = ggml_cuda_get_device();
     const int cc = ggml_cuda_info().devices[id].cc;
@@ -1482,8 +1483,8 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
 
     const dim3 block_dims(warp_size, nwarps, 1);
 
-    CUDA_SET_SHARED_MEMORY_LIMIT((mul_mat_q<type, J, false>), nbytes_shared);
-    CUDA_SET_SHARED_MEMORY_LIMIT((mul_mat_q<type, J,  true>), nbytes_shared);
+    CUDA_SET_SHARED_MEMORY_LIMIT((mul_mat_q<type, J, false, use_cache_source>), nbytes_shared);
+    CUDA_SET_SHARED_MEMORY_LIMIT((mul_mat_q<type, J,  true, use_cache_source>), nbytes_shared);
 
     const int nty  = (args.nrows_x   + config.I - 1) / config.I;
     const int64_t compact_route_tile_bound = route_tile_bounds
@@ -1516,12 +1517,12 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
     const uint3 sample_ratio_fd    = init_fastdiv_values(sample_ratio);
 
     if (route_tile_bounds) {
-        ggml_cuda_launch_expert_route_tiles(args.expert_bounds, route_tile_bounds,
+        ggml_cuda_launch_expert_cache_route_tiles(args.expert_bounds, route_tile_bounds,
             args.nchannels_y, config.J, stream);
     }
 
     if (!use_stream_k) {
-        mul_mat_q<type, J, fallback><<<block_nums_xy_tiling, block_dims, nbytes_shared, stream>>>
+        mul_mat_q<type, J, fallback, use_cache_source><<<block_nums_xy_tiling, block_dims, nbytes_shared, stream>>>
             (args.x, args.y, args.ids_dst, args.expert_bounds, route_tile_bounds, args.source_ids, args.source_host, args.source_host_stride,
              args.source_ids_stride, args.source_ids_width,
              args.dst, nullptr, args.y_scale,
@@ -1552,7 +1553,7 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
     const dim3 block_nums_fixup(block_nums_stream_k.x, config.I/warp_size, 1);
     const dim3 block_dims_fixup(block_dims.x, block_dims.y/2, block_dims.z);
 
-    mul_mat_q<type, J, fallback><<<block_nums_stream_k, block_dims, nbytes_shared, stream>>>
+    mul_mat_q<type, J, fallback, use_cache_source><<<block_nums_stream_k, block_dims, nbytes_shared, stream>>>
         (args.x, args.y, args.ids_dst, args.expert_bounds, route_tile_bounds, args.source_ids, args.source_host, args.source_host_stride,
          args.source_ids_stride, args.source_ids_width,
          args.dst, tmp_fixup.ptr, args.y_scale,
@@ -1572,7 +1573,7 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
          ntx_fd);
 }
 
-template <ggml_type type, bool fallback>
+template <ggml_type type, bool fallback, bool use_cache_source>
 void mul_mat_q_switch_J(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream) {
     const int    id    = ggml_cuda_get_device();
     const int    cc    = ggml_cuda_info().devices[id].cc;
@@ -1601,52 +1602,52 @@ void mul_mat_q_switch_J(ggml_backend_cuda_context & ctx, const mmq_args & args, 
 
     switch (J_best) {
         case   8:
-            launch_mul_mat_q<type,   8, fallback>(ctx, args, stream);
+            launch_mul_mat_q<type,   8, fallback, use_cache_source>(ctx, args, stream);
             break;
         case  16:
-            launch_mul_mat_q<type,  16, fallback>(ctx, args, stream);
+            launch_mul_mat_q<type,  16, fallback, use_cache_source>(ctx, args, stream);
             break;
         case  24:
-            launch_mul_mat_q<type,  24, fallback>(ctx, args, stream);
+            launch_mul_mat_q<type,  24, fallback, use_cache_source>(ctx, args, stream);
             break;
         case  32:
-            launch_mul_mat_q<type,  32, fallback>(ctx, args, stream);
+            launch_mul_mat_q<type,  32, fallback, use_cache_source>(ctx, args, stream);
             break;
         case  40:
-            launch_mul_mat_q<type,  40, fallback>(ctx, args, stream);
+            launch_mul_mat_q<type,  40, fallback, use_cache_source>(ctx, args, stream);
             break;
         case  48:
-            launch_mul_mat_q<type,  48, fallback>(ctx, args, stream);
+            launch_mul_mat_q<type,  48, fallback, use_cache_source>(ctx, args, stream);
             break;
         case  56:
-            launch_mul_mat_q<type,  56, fallback>(ctx, args, stream);
+            launch_mul_mat_q<type,  56, fallback, use_cache_source>(ctx, args, stream);
             break;
         case  64:
-            launch_mul_mat_q<type,  64, fallback>(ctx, args, stream);
+            launch_mul_mat_q<type,  64, fallback, use_cache_source>(ctx, args, stream);
             break;
         case  72:
-            launch_mul_mat_q<type,  72, fallback>(ctx, args, stream);
+            launch_mul_mat_q<type,  72, fallback, use_cache_source>(ctx, args, stream);
             break;
         case  80:
-            launch_mul_mat_q<type,  80, fallback>(ctx, args, stream);
+            launch_mul_mat_q<type,  80, fallback, use_cache_source>(ctx, args, stream);
             break;
         case  88:
-            launch_mul_mat_q<type,  88, fallback>(ctx, args, stream);
+            launch_mul_mat_q<type,  88, fallback, use_cache_source>(ctx, args, stream);
             break;
         case  96:
-            launch_mul_mat_q<type,  96, fallback>(ctx, args, stream);
+            launch_mul_mat_q<type,  96, fallback, use_cache_source>(ctx, args, stream);
             break;
         case 104:
-            launch_mul_mat_q<type, 104, fallback>(ctx, args, stream);
+            launch_mul_mat_q<type, 104, fallback, use_cache_source>(ctx, args, stream);
             break;
         case 112:
-            launch_mul_mat_q<type, 112, fallback>(ctx, args, stream);
+            launch_mul_mat_q<type, 112, fallback, use_cache_source>(ctx, args, stream);
             break;
         case 120:
-            launch_mul_mat_q<type, 120, fallback>(ctx, args, stream);
+            launch_mul_mat_q<type, 120, fallback, use_cache_source>(ctx, args, stream);
             break;
         case 128:
-            launch_mul_mat_q<type, 128, fallback>(ctx, args, stream);
+            launch_mul_mat_q<type, 128, fallback, use_cache_source>(ctx, args, stream);
             break;
         default:
             fprintf(stderr, "J_best=%d\n", J_best);
@@ -1659,10 +1660,18 @@ template <ggml_type type>
 void mul_mat_q_case(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream) {
     if (args.nrows_x % 128 == 0) {
         constexpr bool fallback = false;
-        mul_mat_q_switch_J<type, fallback>(ctx, args, stream);
+        if (args.source_ids != nullptr) {
+            mul_mat_q_switch_J<type, fallback, true>(ctx, args, stream);
+        } else {
+            mul_mat_q_switch_J<type, fallback, false>(ctx, args, stream);
+        }
     } else {
         constexpr bool fallback = true;
-        mul_mat_q_switch_J<type, fallback>(ctx, args, stream);
+        if (args.source_ids != nullptr) {
+            mul_mat_q_switch_J<type, fallback, true>(ctx, args, stream);
+        } else {
+            mul_mat_q_switch_J<type, fallback, false>(ctx, args, stream);
+        }
     }
 }
 
@@ -1698,7 +1707,11 @@ extern DECL_MMQ_CASE(GGML_TYPE_NVFP4);
 // -------------------------------------------------------------------------------------------------------------------------
 
 void ggml_cuda_mul_mat_q(
-        ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
-        const ggml_cuda_expert_source_view * source = nullptr);
+        ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1,
+        const ggml_tensor * ids, ggml_tensor * dst);
+
+void ggml_cuda_mul_mat_q_moe_cache(
+        ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1,
+        const ggml_tensor * ids, ggml_tensor * dst, const ggml_cuda_expert_source_view & source);
 
 bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t n_experts);

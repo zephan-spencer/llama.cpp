@@ -1,43 +1,141 @@
 #include "expert-cache-private.cuh"
 #include "expert-cache.cuh"
+#include "ggml-backend-impl.h"
 #include "ggml-cuda.h"
 #include "ggml-impl.h"
 #include "expert-cache-policy.cuh"
-#include "mmid.cuh"
+#include "expert-cache-route.cuh"
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstdint>
 #include <cstring>
+#include <memory>
+#include <mutex>
+#include <unordered_map>
 #include <vector>
 
 #if defined(GGML_USE_HIP)
 
+static bool ggml_backend_cuda_moe_cache_supports_type(ggml_type type) {
+    switch (type) {
+        case GGML_TYPE_Q1_0:
+        case GGML_TYPE_Q2_0:
+        case GGML_TYPE_Q4_0:
+        case GGML_TYPE_Q4_1:
+        case GGML_TYPE_Q5_0:
+        case GGML_TYPE_Q5_1:
+        case GGML_TYPE_Q8_0:
+        case GGML_TYPE_Q2_K:
+        case GGML_TYPE_Q3_K:
+        case GGML_TYPE_Q4_K:
+        case GGML_TYPE_Q5_K:
+        case GGML_TYPE_Q6_K:
+        case GGML_TYPE_IQ1_S:
+        case GGML_TYPE_IQ2_XXS:
+        case GGML_TYPE_IQ2_XS:
+        case GGML_TYPE_IQ2_S:
+        case GGML_TYPE_IQ3_XXS:
+        case GGML_TYPE_IQ3_S:
+        case GGML_TYPE_IQ4_XS:
+        case GGML_TYPE_IQ4_NL:
+        case GGML_TYPE_MXFP4:
+        case GGML_TYPE_NVFP4:
+            return true;
+        default:
+            return false;
+    }
+}
+
+static bool ggml_backend_cuda_moe_cache_supports_weight(
+        ggml_backend_dev_t device, const ggml_tensor * tensor) {
+    return device != nullptr && ggml_backend_dev_type(device) == GGML_BACKEND_DEVICE_TYPE_GPU &&
+           tensor != nullptr && ggml_backend_cuda_moe_cache_supports_type(tensor->type) &&
+           tensor->ne[2] > 0 && tensor->ne[3] == 1 &&
+           tensor->nb[2] % sizeof(uint4) == 0;
+}
+
+static const char * ggml_backend_cuda_moe_cache_source_buffer_name(ggml_backend_buffer_type_t) {
+    return GGML_CUDA_NAME "_MoE_Cache_Host";
+}
+
+static void ggml_backend_cuda_moe_cache_source_buffer_free(ggml_backend_buffer_t buffer) {
+    CUDA_CHECK(cudaFreeHost(buffer->context));
+}
+
+static ggml_backend_buffer_t ggml_backend_cuda_moe_cache_source_buffer_alloc(
+        ggml_backend_buffer_type_t buft, size_t size) {
+    if (getenv("GGML_CUDA_NO_PINNED") != nullptr) {
+        return nullptr;
+    }
+
+    void * ptr = nullptr;
+    const hipError_t error = hipHostMalloc(&ptr, size, hipHostMallocMapped);
+    if (error != hipSuccess) {
+        (void) hipGetLastError();
+        return nullptr;
+    }
+
+    ggml_backend_buffer_t buffer = ggml_backend_cpu_buffer_from_ptr(ptr, size);
+    buffer->buft                 = buft;
+    buffer->iface.free_buffer    = ggml_backend_cuda_moe_cache_source_buffer_free;
+    return buffer;
+}
+
 static ggml_backend_buffer_type_t ggml_backend_cuda_moe_cache_source_buffer_type(ggml_backend_dev_t device) {
-    return device != nullptr && ggml_backend_dev_type(device) == GGML_BACKEND_DEVICE_TYPE_GPU ?
-               ggml_backend_dev_host_buffer_type(device) :
-               nullptr;
+    if (device == nullptr || ggml_backend_dev_type(device) != GGML_BACKEND_DEVICE_TYPE_GPU) {
+        return nullptr;
+    }
+
+    static std::mutex mutex;
+    static std::unordered_map<ggml_backend_dev_t, std::unique_ptr<ggml_backend_buffer_type>> types;
+    std::lock_guard<std::mutex> lock(mutex);
+
+    auto & result = types[device];
+    if (!result) {
+        result = std::make_unique<ggml_backend_buffer_type>();
+        *result = {
+            /* .iface   = */ {
+                /* .get_name       = */ ggml_backend_cuda_moe_cache_source_buffer_name,
+                /* .alloc_buffer   = */ ggml_backend_cuda_moe_cache_source_buffer_alloc,
+                /* .get_alignment  = */ ggml_backend_cpu_buffer_type()->iface.get_alignment,
+                /* .get_max_size   = */ nullptr,
+                /* .get_alloc_size = */ ggml_backend_cpu_buffer_type()->iface.get_alloc_size,
+                /* .is_host        = */ ggml_backend_cpu_buffer_type()->iface.is_host,
+            },
+            /* .device  = */ device,
+            /* .context = */ nullptr,
+        };
+    }
+    return result.get();
 }
 
 static size_t ggml_backend_cuda_moe_cache_state_size(ggml_backend_dev_t device,
+                                                     enum ggml_backend_moe_cache_policy policy,
                                                      uint32_t           n_expert,
                                                      uint32_t           n_cache,
                                                      uint32_t           n_weights) {
-    if (ggml_backend_cuda_moe_cache_source_buffer_type(device) == nullptr || n_expert == 0 || n_cache == 0 ||
+    const ggml_cuda_expert_cache_policy_i * policy_api = ggml_cuda_expert_cache_policy(policy);
+    if (ggml_backend_cuda_moe_cache_source_buffer_type(device) == nullptr || policy_api == nullptr ||
+        n_expert == 0 || n_cache == 0 ||
         n_cache >= n_expert || n_weights == 0 || n_weights > GGML_BACKEND_MOE_CACHE_MAX_WEIGHTS) {
         return 0;
     }
-    return ggml_cuda_expert_cache_layout(n_expert, n_cache).state_size;
+    return ggml_cuda_expert_cache_layout(n_expert, n_cache, policy_api->state_size(n_expert, n_cache)).state_size;
 }
 
 static ggml_backend_moe_cache_t ggml_backend_cuda_moe_cache_create(ggml_backend_t        backend,
                                                                    ggml_tensor *         state,
                                                                    ggml_tensor * const * source,
                                                                    ggml_tensor * const * slots,
+                                                                   enum ggml_backend_moe_cache_policy policy,
                                                                    uint32_t              n_expert,
                                                                    uint32_t              n_cache,
                                                                    uint32_t              n_weights) {
     const ggml_backend_dev_t device     = backend != nullptr ? ggml_backend_get_device(backend) : nullptr;
-    const size_t             state_size = ggml_backend_cuda_moe_cache_state_size(device, n_expert, n_cache, n_weights);
+    const ggml_cuda_expert_cache_policy_i * policy_api = ggml_cuda_expert_cache_policy(policy);
+    const size_t state_size = ggml_backend_cuda_moe_cache_state_size(
+        device, policy, n_expert, n_cache, n_weights);
     if (backend == nullptr || state_size == 0 || state == nullptr || source == nullptr || slots == nullptr ||
         state->buffer == nullptr || ggml_nbytes(state) < state_size) {
         return nullptr;
@@ -54,19 +152,21 @@ static ggml_backend_moe_cache_t ggml_backend_cuda_moe_cache_create(ggml_backend_
     desc.n_expert                      = n_expert;
     desc.n_cache                       = n_cache;
     desc.n_weights                     = n_weights;
+    desc.policy                        = policy;
     desc.state_size                    = state_size;
-    const auto layout                  = ggml_cuda_expert_cache_layout(n_expert, n_cache);
+    const auto layout                  = ggml_cuda_expert_cache_layout(
+        n_expert, n_cache, policy_api->state_size(n_expert, n_cache));
     desc.expert_to_cache_offset        = layout.expert_to_cache_offset;
     desc.cache_to_expert_offset        = layout.cache_to_expert_offset;
-    desc.last_used_offset              = layout.last_used_offset;
-    desc.protected_epoch_offset        = layout.protected_epoch_offset;
-    desc.pending_priority_epoch_offset = layout.pending_priority_epoch_offset;
     desc.fill_expert_offset            = layout.fill_expert_offset;
     desc.fill_slot_offset              = layout.fill_slot_offset;
+    desc.policy_state_offset           = layout.policy_state_offset;
     for (uint32_t i = 0; i < n_weights; ++i) {
-        if (source[i] == nullptr || slots[i] == nullptr || source[i]->buffer == nullptr || source[i]->data == nullptr ||
+        if (!ggml_backend_cuda_moe_cache_supports_weight(device, source[i]) || slots[i] == nullptr ||
+            source[i]->buffer == nullptr || source[i]->data == nullptr ||
             slots[i]->buffer == nullptr || !ggml_backend_buffer_is_host(source[i]->buffer) ||
-            ggml_backend_buffer_get_type(source[i]->buffer) != ggml_backend_dev_host_buffer_type(device) ||
+            ggml_backend_buffer_get_type(source[i]->buffer) !=
+                ggml_backend_cuda_moe_cache_source_buffer_type(device) ||
             ggml_backend_buft_get_device(ggml_backend_buffer_get_type(slots[i]->buffer)) != device ||
             source[i]->type != slots[i]->type || source[i]->ne[0] != slots[i]->ne[0] ||
             source[i]->ne[1] != slots[i]->ne[1] || source[i]->ne[2] != n_expert || source[i]->ne[3] != 1 ||
@@ -101,6 +201,7 @@ static ggml_backend_moe_cache_t ggml_backend_cuda_moe_cache_create(ggml_backend_
     auto *               cache_to_expert = reinterpret_cast<int32_t *>(data.data() + desc.cache_to_expert_offset);
     std::fill(expert_to_cache, expert_to_cache + n_expert, -1);
     std::fill(cache_to_expert, cache_to_expert + n_cache, -1);
+    policy_api->initialize(data.data() + desc.policy_state_offset, n_expert, n_cache);
     ggml_backend_tensor_set(state, data.data(), 0, data.size());
     return cache;
 }
@@ -144,12 +245,8 @@ static bool ggml_backend_cuda_moe_cache_get_plan_layout(
 
 static ggml_backend_moe_cache_plan ggml_backend_cuda_moe_cache_build_plan(ggml_backend_moe_cache_t cache,
                                                                           ggml_context *           ctx,
-                                                                          ggml_tensor *            ids,
-                                                                          ggml_tensor *            token_priority,
-                                                                          ggml_tensor *            epoch) {
-    if (cache == nullptr || ctx == nullptr || ids == nullptr || token_priority == nullptr || epoch == nullptr ||
-        ids->type != GGML_TYPE_I32 || token_priority->type != GGML_TYPE_I32 || epoch->type != GGML_TYPE_I32 ||
-        ggml_nelements(token_priority) != ids->ne[1] || ggml_nelements(epoch) != 1) {
+                                                                          ggml_tensor *            ids) {
+    if (cache == nullptr || ctx == nullptr || ids == nullptr || ids->type != GGML_TYPE_I32) {
         return { nullptr, nullptr };
     }
 
@@ -158,17 +255,15 @@ static ggml_backend_moe_cache_plan ggml_backend_cuda_moe_cache_build_plan(ggml_b
         return { nullptr, nullptr };
     }
 
-    ggml_tensor * args[4 + GGML_BACKEND_MOE_CACHE_MAX_WEIGHTS] = {};
+    ggml_tensor * args[2 + GGML_BACKEND_MOE_CACHE_MAX_WEIGHTS] = {};
     args[0]                                                    = ids;
-    args[1]                                                    = token_priority;
-    args[2]                                                    = epoch;
-    args[3]                                                    = cache->state;
+    args[1]                                                    = cache->state;
     for (uint32_t i = 0; i < cache->desc.n_weights; ++i) {
-        args[4 + i] = cache->slots[i];
+        args[2 + i] = cache->slots[i];
     }
     auto * execution = ggml_custom_4d(ctx, layout.execution_type, layout.execution_ne[0], layout.execution_ne[1],
                                       layout.execution_ne[2], layout.execution_ne[3], args,
-                                      4 + cache->desc.n_weights, nullptr, 1, &cache->desc);
+                                      2 + cache->desc.n_weights, nullptr, 1, &cache->desc);
     auto * selectors = ggml_view_4d(ctx, execution, layout.selectors_ne[0], layout.selectors_ne[1],
                                     layout.selectors_ne[2], layout.selectors_ne[3], layout.selectors_nb[1],
                                     layout.selectors_nb[2], layout.selectors_nb[3], layout.selectors_offset);
@@ -177,6 +272,7 @@ static ggml_backend_moe_cache_plan ggml_backend_cuda_moe_cache_build_plan(ggml_b
 }
 
 static const ggml_backend_moe_cache_i ggml_backend_cuda_moe_cache_interface = {
+    ggml_backend_cuda_moe_cache_supports_weight,
     ggml_backend_cuda_moe_cache_source_buffer_type,
     ggml_backend_cuda_moe_cache_state_size,
     ggml_backend_cuda_moe_cache_create,
@@ -203,11 +299,9 @@ struct expert_cache_params {
     uint32_t            n_routes;
     uint64_t            expert_to_cache_offset;
     uint64_t            cache_to_expert_offset;
-    uint64_t            last_used_offset;
-    uint64_t            protected_epoch_offset;
-    uint64_t            pending_priority_epoch_offset;
     uint64_t            fill_expert_offset;
     uint64_t            fill_slot_offset;
+    uint64_t            policy_state_offset;
 };
 
 static ggml_backend_cuda_expert_cache_desc * expert_cache_desc(const ggml_tensor * dst) {
@@ -277,18 +371,10 @@ bool ggml_cuda_expert_cache_supported(const ggml_tensor * dst) {
     if (ggml_nbytes(dst) < route_layout.size) {
         return false;
     }
-    if (dst->src[1] == nullptr || dst->src[1]->type != GGML_TYPE_I32 || !ggml_is_contiguous(dst->src[1]) ||
-        ggml_nelements(dst->src[1]) != dst->src[0]->ne[1]) {
-        return false;
-    }
-    if (dst->src[2] == nullptr || dst->src[2]->type != GGML_TYPE_I32 || !ggml_is_contiguous(dst->src[2]) ||
-        ggml_nelements(dst->src[2]) != 1) {
-        return false;
-    }
     if (desc->n_expert == 0 || desc->n_cache == 0 || desc->n_cache > desc->n_expert) {
         return false;
     }
-    const int state_index = 3;
+    const int state_index = 1;
     if (dst->src[state_index] == nullptr || ggml_nbytes(dst->src[state_index]) < desc->state_size) {
         return false;
     }
@@ -305,9 +391,7 @@ void ggml_cuda_expert_cache(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
     ggml_backend_cuda_expert_cache_desc * desc = expert_cache_desc(dst);
     GGML_ASSERT(desc != nullptr);
 
-    const int priority_index = 1;
-    const int epoch_index    = 2;
-    const int state_index    = 3;
+    const int state_index = 1;
 
     expert_cache_params params           = {};
     params.n_expert                      = desc->n_expert;
@@ -316,11 +400,9 @@ void ggml_cuda_expert_cache(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
     params.n_routes                      = ggml_nelements(dst->src[0]);
     params.expert_to_cache_offset        = desc->expert_to_cache_offset;
     params.cache_to_expert_offset        = desc->cache_to_expert_offset;
-    params.last_used_offset              = desc->last_used_offset;
-    params.protected_epoch_offset        = desc->protected_epoch_offset;
-    params.pending_priority_epoch_offset = desc->pending_priority_epoch_offset;
     params.fill_expert_offset            = desc->fill_expert_offset;
     params.fill_slot_offset              = desc->fill_slot_offset;
+    params.policy_state_offset           = desc->policy_state_offset;
 
     for (uint32_t i = 0; i < desc->n_weights; ++i) {
         if (desc->weights[i].device_data == nullptr) {
@@ -364,22 +446,18 @@ void ggml_cuda_expert_cache(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
     policy.fill_slot   = reinterpret_cast<int32_t *>(state_data + params.fill_slot_offset);
     policy.expert_to_cache        = reinterpret_cast<int32_t *>(state_data + params.expert_to_cache_offset);
     policy.cache_to_expert        = reinterpret_cast<int32_t *>(state_data + params.cache_to_expert_offset);
-    policy.last_used              = reinterpret_cast<uint64_t *>(state_data + params.last_used_offset);
-    policy.protected_epoch        = reinterpret_cast<uint64_t *>(state_data + params.protected_epoch_offset);
-    policy.pending_priority_epoch = reinterpret_cast<uint64_t *>(state_data + params.pending_priority_epoch_offset);
-    policy.epoch                  = static_cast<const int32_t *>(dst->src[epoch_index]->data);
-    policy.use_clock              = &header->use_clock;
     policy.n_fill                 = &header->n_fills;
-    policy.resolve_active         = &header->resolve_active;
-    policy.policy_flags           = &header->policy_flags;
+    policy.n_active               = &header->n_active;
+    policy.data                   = state_data + params.policy_state_offset;
 
     const int n_expert_used = dst->src[0]->ne[0];
     const int n_tokens      = ggml_nelements(dst->src[0]) / n_expert_used;
     ggml_cuda_launch_expert_cache_selectors(
         static_cast<const int32_t *>(dst->src[0]->data), selectors, policy.expert_to_cache,
-        static_cast<const int32_t *>(dst->src[priority_index]->data), policy.resolve_active, policy.policy_flags,
-        desc->n_expert, n_tokens, n_expert_used, ctx.stream());
-    ggml_cuda_apply_expert_cache_policy(selectors, policy, desc->n_expert, desc->n_cache, ctx.stream());
+        policy.n_active, desc->n_expert, n_tokens, n_expert_used, ctx.stream());
+    const ggml_cuda_expert_cache_policy_i * policy_api = ggml_cuda_expert_cache_policy(desc->policy);
+    GGML_ASSERT(policy_api != nullptr);
+    policy_api->resolve(selectors, policy, desc->n_expert, desc->n_cache, ctx.stream());
     CUDA_CHECK(cudaGetLastError());
 
     expert_cache_copy_kernel<<<32, 256, 0, ctx.stream()>>>(state_data, params);

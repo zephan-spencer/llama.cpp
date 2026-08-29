@@ -21,17 +21,18 @@ Options:
   --tensor-split SPLIT       tensor proportions, e.g. 1/1 (default: automatic)
   --main-gpu INDEX           logical visible GPU for small/intermediate tensors (default: 0)
   --cache-sizes LIST         comma-separated cache sizes (default: 32,64,128,196,255)
+  --policy POLICY            residency policy (default: lru)
   --prompt TOKENS            prompt length (default: 16384; use 0 to disable)
   --generation TOKENS        generated tokens (default: 1024; use 0 to disable)
-  --batch-size TOKENS        logical batch size (default: 4096)
-  --ubatch-size TOKENS       physical ubatch size (default: 4096)
+  --batch-size TOKENS        logical batch size (default: 2048)
+  --ubatch-size TOKENS       physical ubatch size (default: 2048)
   --repetitions N            repetitions per benchmark (default: 5)
   --flash-attn MODE          on, off, or auto (default: on)
   --threads N                CPU thread count (default: llama-bench default)
   --load-mode MODE           auto, none, mmap, mlock, mmap+mlock, or dio
   --binary PATH              llama-bench executable
                              (default: build-hip-tensor/bin/llama-bench)
-  --output PATH              JSONL output (default: benchmark-results/moe-cache.jsonl)
+  --output PATH              JSONL output (default: .git/moe-cache-benchmarks/moe-cache.jsonl)
   --force                    overwrite an existing output and log
   --no-warmup                pass --no-warmup to llama-bench
   -h, --help                 show this help
@@ -40,13 +41,13 @@ Examples:
   # One physical GPU: HIP device 1, with prompt and generation measurements.
   scripts/bench-moe-cache.sh \
     --model ggml-org/Qwen3.6-35B-A3B-GGUF --quant Q4_K_XL \
-    --hip-devices 1 --output benchmark-results/qwen35-q4-single.jsonl
+    --hip-devices 1 --output .git/moe-cache-benchmarks/qwen35-q4-single.jsonl
 
   # Two physical GPUs using tensor parallelism and equal tensor splits.
   scripts/bench-moe-cache.sh \
     --model ggml-org/Qwen3.6-35B-A3B-GGUF --quant Q4_K_XL \
     --hip-devices 0,1 --tensor-parallel --tensor-split 1/1 \
-    --output benchmark-results/qwen35-q4-tensor.jsonl
+    --output .git/moe-cache-benchmarks/qwen35-q4-tensor.jsonl
 EOF
 }
 
@@ -73,16 +74,17 @@ tensor_parallel=0
 tensor_split=''
 main_gpu=0
 cache_sizes='32,64,128,196,255'
+policy='lru'
 prompt_tokens=16384
 generation_tokens=1024
-batch_size=4096
-ubatch_size=4096
+batch_size=2048
+ubatch_size=2048
 repetitions=5
 flash_attn='on'
 threads=''
 load_mode=''
 binary="$repo_root/build-hip-tensor/bin/llama-bench"
-output='benchmark-results/moe-cache.jsonl'
+output="$repo_root/.git/moe-cache-benchmarks/moe-cache.jsonl"
 force=0
 no_warmup=0
 
@@ -120,6 +122,11 @@ while (($#)); do
         --cache-sizes)
             need_value "$@"
             cache_sizes=$2
+            shift 2
+            ;;
+        --policy)
+            need_value "$@"
+            policy=$2
             shift 2
             ;;
         --prompt)
@@ -207,6 +214,7 @@ case "$flash_attn" in
     on|off|auto) ;;
     *) die "--flash-attn must be on, off, or auto" ;;
 esac
+[[ "$policy" == lru ]] || die "--policy must be lru"
 
 IFS=',' read -r -a hip_ids <<< "$hip_devices"
 (( ${#hip_ids[@]} > 0 )) || die "--hip-devices cannot be empty"
@@ -317,6 +325,6 @@ else
 fi
 
 run_case 'fully resident baseline'
-run_case "expert cache sizes: $cache_sizes" --moe-cache-experts "$cache_sizes"
+run_case "expert cache sizes: $cache_sizes" --moe-cache-experts "$cache_sizes" --moe-cache-policy "$policy"
 
-printf 'Done. The plotter can consume %s directly.\n' "$output"
+printf 'Done. Results are in %s.\n' "$output"

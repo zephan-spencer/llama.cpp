@@ -178,6 +178,12 @@ static void test(void) {
     argv = {"binary_name", "--moe-cache-experts", "0"};
     assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
 
+    argv = {"binary_name", "--moe-cache-policy", "unknown"};
+    assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
+
+    argv = {"binary_name", "--spec-draft-moe-cache-experts", "64"};
+    assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SPECULATIVE));
+
     common_params conflict_params;
     argv = {"binary_name", "-m", "model_file.gguf", "--cpu-moe", "--moe-cache-experts", "64"};
     assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), conflict_params, LLAMA_EXAMPLE_COMMON));
@@ -239,6 +245,11 @@ static void test(void) {
     assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
     assert(params.n_moe_cache_experts == 64);
     assert(common_model_params_to_llama(params).n_moe_cache_experts == 64);
+
+    argv = {"binary_name", "--moe-cache-policy", "lru"};
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
+    assert(params.moe_cache_policy == LLAMA_MOE_CACHE_POLICY_LRU);
+    assert(common_model_params_to_llama(params).moe_cache_policy == LLAMA_MOE_CACHE_POLICY_LRU);
 
     // multi-value args (CSV)
     argv = {"binary_name", "--lora", "file1.gguf,\"file2,2.gguf\",\"file3\"\"3\"\".gguf\",file4\".gguf"};

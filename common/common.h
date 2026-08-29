@@ -336,8 +336,6 @@ struct common_params_speculative_draft {
     llama_context * ctx_dft = nullptr;
 
     int32_t n_gpu_layers = -1; // number of layers to store in VRAM for the draft model (-1 - use default)
-    // routed experts to cache per draft MoE layer; -1 inherits --moe-cache-experts, 0 disables the cache
-    int32_t n_moe_cache_experts = -1;
 
     ggml_type cache_type_k = GGML_TYPE_F16; // KV cache data type for the K
     ggml_type cache_type_v = GGML_TYPE_F16; // KV cache data type for the V
@@ -464,9 +462,10 @@ struct common_params {
     // offload params
     std::vector<ggml_backend_dev_t> devices; // devices to use for offloading
 
-    int32_t n_gpu_layers        = -1;   // number of layers to store in VRAM, -1 is auto, <= -2 is all
-    int32_t n_moe_cache_experts = 0;    // number of routed experts to cache per MoE layer
-    int32_t main_gpu            = 0;    // the GPU that is used for scratch and small tensors
+    int32_t n_gpu_layers       = -1;    // number of layers to store in VRAM, -1 is auto, <= -2 is all
+    int32_t                     n_moe_cache_experts = 0; // number of routed experts to cache per MoE layer
+    enum llama_moe_cache_policy moe_cache_policy = LLAMA_MOE_CACHE_POLICY_LRU;
+    int32_t main_gpu           = 0;     // the GPU that is used for scratch and small tensors
     float   tensor_split[128]  = {0};   // how split tensors should be distributed across GPUs
     bool    cpu_moe            = false; // whether a CPU MoE placement option was specified
     bool    fit_params         = true;  // whether to fit unset model/context parameters to free device memory

@@ -349,7 +349,7 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
             throw std::runtime_error("error loading model hyperparameters: " + std::string(e.what()));
         }
         if (params.n_moe_cache_experts > 0) {
-            llama_moe_cache_validate_model(*model, params.n_moe_cache_experts);
+            llama_moe_cache_validate_model(*model, params.n_moe_cache_experts, params.moe_cache_policy);
         }
         if (model->arch == LLM_ARCH_CLIP) {
             throw std::runtime_error("CLIP cannot be used as main model, use it with --mmproj instead");

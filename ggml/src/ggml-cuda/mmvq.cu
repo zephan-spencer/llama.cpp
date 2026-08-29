@@ -541,7 +541,8 @@ static constexpr __host__ __device__ int calc_rows_per_block(int ncols_dst, int 
     return 1;
 }
 
-template <ggml_type type, int ncols_dst, bool has_fusion, bool small_k = false, bool halve_iters = false>
+template <ggml_type type, int ncols_dst, bool has_fusion, bool use_cache_source,
+          bool small_k = false, bool halve_iters = false>
 __launch_bounds__(calc_nwarps(type, ncols_dst, get_device_table_id(), small_k, halve_iters)*ggml_cuda_get_physical_warp_size(), 1)
 static __global__ void mul_mat_vec_q(
         const void * vx_ptr, const void * vy_ptr, const int32_t * ids_ptr, const int32_t * source_ids_ptr,
@@ -584,7 +585,7 @@ static __global__ void mul_mat_vec_q(
     ggml_cuda_pdl_sync();
     channel_x  = ncols_dst == 1 && ids ? ids[channel_dst]                     : fastdiv(channel_dst, channel_ratio);
     source_channel_x = channel_x;
-    if (ncols_dst == 1 && source_ids != nullptr) {
+    if constexpr (use_cache_source && ncols_dst == 1) {
         const int source_id = source_ids[channel_dst];
         source_channel_x = source_id >= 0 ? source_id : -source_id - 1;
         use_host_source = source_id < 0;
@@ -615,9 +616,6 @@ static __global__ void mul_mat_vec_q(
         use_bias      = fusion.x_bias    != nullptr;
         use_gate_bias = fusion.gate_bias != nullptr && use_gate;
         vgate         = fusion.gate;
-        if (use_gate && use_host_source) {
-            vgate = fusion.gate_host;
-        }
         x_bias        = (const float *) fusion.x_bias;
         gate_bias     = (const float *) fusion.gate_bias;
         active_glu    = fusion.glu_op;
@@ -671,9 +669,8 @@ static __global__ void mul_mat_vec_q(
 
     const block_q8_1 * y = ((const block_q8_1 *) vy) + sample_y*stride_sample_y + channel_y*stride_channel_y;
     const uint32_t source_stride = use_host_source ? source_host_stride : stride_channel_x;
-    const uint32_t gate_source_stride = use_host_source ? fusion.gate_host_stride : stride_channel_x;
     const int kbx_offset = sample_x*stride_sample_x + source_channel_x*source_stride + row0*stride_row_x;
-    const int gate_kbx_offset = sample_x*stride_sample_x + source_channel_x*gate_source_stride + row0*stride_row_x;
+    const int gate_kbx_offset = sample_x*stride_sample_x + channel_x*stride_channel_x + row0*stride_row_x;
 
     for (int kbx = tid / (qi/vdr); kbx < blocks_per_row_x; kbx += blocks_per_iter) {
         const int kby = kbx * (qk/QK8_1); // y block index that aligns with kbx
@@ -788,7 +785,7 @@ static __global__ void mul_mat_vec_q(
 // Grid: (ceil(nrows_x / c_rows_per_block), nchannels_dst)
 // Block: (warp_size, ncols_dst) - each warp handles one token independently.
 // No shared memory reduction needed since each warp works alone.
-template <ggml_type type, int c_rows_per_block>
+template <ggml_type type, int c_rows_per_block, bool use_cache_source>
 __launch_bounds__(get_mmvq_mmid_max_batch_for_device<type>()*ggml_cuda_get_physical_warp_size(), 1)
 static __global__ void mul_mat_vec_q_moe(
         const void * vx_ptr, const void * vy_ptr, const int32_t * ids_ptr, const int32_t * source_ids_ptr,
@@ -825,7 +822,10 @@ static __global__ void mul_mat_vec_q_moe(
     ggml_cuda_pdl_sync();
     const uint32_t route = channel_dst + token_idx * ids_stride;
     const int32_t logical_channel_x = ids[route];
-    const int32_t source_id = source_ids != nullptr ? source_ids[channel_dst + token_idx * source_ids_stride] : logical_channel_x;
+    int32_t source_id = logical_channel_x;
+    if constexpr (use_cache_source) {
+        source_id = source_ids[channel_dst + token_idx * source_ids_stride];
+    }
     const uint32_t channel_x = source_id >= 0 ? source_id : -source_id - 1;
     const uint32_t source_stride = source_id < 0 ? source_host_stride : stride_channel_x;
     if (source_id < 0) {
@@ -891,13 +891,19 @@ static void mul_mat_vec_q_switch_fusion(
     if constexpr (c_ncols_dst == 1) {
         if (has_fusion) {
             const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, nbytes_shared, stream);
-            ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, true, small_k, halve_iters>, launch_params,
-                 vx, vy, ids, source != nullptr ? source->selectors : nullptr,
-                 source != nullptr ? source->host_data : nullptr,
-                 source != nullptr ? source->host_stride : 0,
-                 fusion, dst, ncols_x, nchannels_y, stride_row_x, stride_col_y, stride_col_dst,
-                 channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
-                 sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride);
+            if (source != nullptr) {
+                ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, true, true, small_k, halve_iters>, launch_params,
+                     vx, vy, ids, source->selectors, source->host_data, source->host_stride,
+                     fusion, dst, ncols_x, nchannels_y, stride_row_x, stride_col_y, stride_col_dst,
+                     channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
+                     sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride);
+            } else {
+                ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, true, false, small_k, halve_iters>, launch_params,
+                     vx, vy, ids, nullptr, nullptr, 0,
+                     fusion, dst, ncols_x, nchannels_y, stride_row_x, stride_col_y, stride_col_dst,
+                     channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
+                     sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride);
+            }
             return;
         }
     }
@@ -905,13 +911,19 @@ static void mul_mat_vec_q_switch_fusion(
     GGML_ASSERT(!has_fusion && "fusion only supported for ncols_dst=1");
 
     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, nbytes_shared, stream);
-    ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, false, small_k, halve_iters>, launch_params,
-        vx, vy, ids, source != nullptr ? source->selectors : nullptr,
-        source != nullptr ? source->host_data : nullptr,
-        source != nullptr ? source->host_stride : 0,
-        fusion, dst, ncols_x, nchannels_y, stride_row_x, stride_col_y, stride_col_dst,
-        channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
-        sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride);
+    if (source != nullptr) {
+        ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, false, true, small_k, halve_iters>, launch_params,
+            vx, vy, ids, source->selectors, source->host_data, source->host_stride,
+            fusion, dst, ncols_x, nchannels_y, stride_row_x, stride_col_y, stride_col_dst,
+            channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
+            sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride);
+    } else {
+        ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, false, false, small_k, halve_iters>, launch_params,
+            vx, vy, ids, nullptr, nullptr, 0,
+            fusion, dst, ncols_x, nchannels_y, stride_row_x, stride_col_y, stride_col_dst,
+            channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
+            sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride);
+    }
 }
 
 template <ggml_type type>
@@ -929,15 +941,21 @@ static void mul_mat_vec_q_moe_launch(
     const dim3 block_dims(warp_size, ncols_dst);
     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, 0, stream);
 
-    ggml_cuda_kernel_launch(mul_mat_vec_q_moe<type, rows_per_block>, launch_params,
-        vx, vy, ids, source != nullptr ? source->selectors : nullptr,
-        source != nullptr ? source->host_data : nullptr,
-        source != nullptr ? source->host_stride : 0,
-        source != nullptr ? source->selector_stride : 0,
-        dst, ncols_x, nchannels_y, nrows_x,
-        stride_row_x, stride_col_y, stride_col_dst,
-        stride_channel_x, stride_channel_y, stride_channel_dst,
-        ncols_dst, ids_stride);
+    if (source != nullptr) {
+        ggml_cuda_kernel_launch(mul_mat_vec_q_moe<type, rows_per_block, true>, launch_params,
+            vx, vy, ids, source->selectors, source->host_data, source->host_stride, source->selector_stride,
+            dst, ncols_x, nchannels_y, nrows_x,
+            stride_row_x, stride_col_y, stride_col_dst,
+            stride_channel_x, stride_channel_y, stride_channel_dst,
+            ncols_dst, ids_stride);
+    } else {
+        ggml_cuda_kernel_launch(mul_mat_vec_q_moe<type, rows_per_block, false>, launch_params,
+            vx, vy, ids, nullptr, nullptr, 0, 0,
+            dst, ncols_x, nchannels_y, nrows_x,
+            stride_row_x, stride_col_y, stride_col_dst,
+            stride_channel_x, stride_channel_y, stride_channel_dst,
+            ncols_dst, ids_stride);
+    }
 }
 
 template <ggml_type type>
@@ -1288,7 +1306,7 @@ static void mul_mat_vec_q_switch_type(
     }
 }
 
-void ggml_cuda_mul_mat_vec_q(
+static void ggml_cuda_mul_mat_vec_q_impl(
         ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
         const ggml_cuda_mm_fusion_args_host * fusion, const ggml_cuda_expert_source_view * source) {
     GGML_ASSERT(        src1->type == GGML_TYPE_F32);
@@ -1332,9 +1350,6 @@ void ggml_cuda_mul_mat_vec_q(
         if (fusion->gate) {
             GGML_ASSERT(fusion->gate->type == src0->type && ggml_are_same_stride(fusion->gate, src0));
             fusion_local.gate             = fusion->gate->data;
-            fusion_local.gate_host        = fusion->gate_host;
-            fusion_local.gate_host_stride = fusion->gate_host_stride;
-            GGML_ASSERT(source == nullptr || fusion_local.gate_host != nullptr);
         }
         if (fusion->gate_bias) {
             GGML_ASSERT(fusion->gate_bias->type == GGML_TYPE_F32);
@@ -1404,6 +1419,18 @@ void ggml_cuda_mul_mat_vec_q(
         ne01,              ncols_dst,     s01, stride_col_y,     stride_col_dst,
         ne02, nchannels_y, nchannels_dst, s02, stride_channel_y, stride_channel_dst,
         ne03,              ne3,           s03, s13,              s3,               ids_stride, stream);
+}
+
+void ggml_cuda_mul_mat_vec_q(
+        ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1,
+        const ggml_tensor * ids, ggml_tensor * dst, const ggml_cuda_mm_fusion_args_host * fusion) {
+    ggml_cuda_mul_mat_vec_q_impl(ctx, src0, src1, ids, dst, fusion, nullptr);
+}
+
+void ggml_cuda_mul_mat_vec_q_moe_cache(
+        ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1,
+        const ggml_tensor * ids, ggml_tensor * dst, const ggml_cuda_expert_source_view & source) {
+    ggml_cuda_mul_mat_vec_q_impl(ctx, src0, src1, ids, dst, nullptr, &source);
 }
 
 void ggml_cuda_op_mul_mat_vec_q(

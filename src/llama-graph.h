@@ -11,7 +11,6 @@
 #include <set>
 #include <functional>
 #include <map>
-#include <utility>
 
 struct ggml_cgraph;
 struct ggml_context;
@@ -233,20 +232,6 @@ public:
     const llama_cparams cparams;
 
     const uint32_t n_outputs;
-};
-
-class llm_graph_input_moe_cache : public llm_graph_input_i {
-public:
-    llm_graph_input_moe_cache(const llama_moe_expert_cache * cache) : cache(cache) {}
-
-    void set_input(const llama_ubatch * ubatch) override;
-
-    bool can_reuse(const llm_graph_params & params) override;
-
-    ggml_tensor * priority = nullptr; // I32 [n_batch]
-    ggml_tensor * epoch    = nullptr; // I32 [1]
-
-    const llama_moe_expert_cache * cache;
 };
 
 class llm_graph_input_mean : public llm_graph_input_i {
@@ -1053,10 +1038,6 @@ struct llm_graph_context {
 
     ggml_context * ctx0 = nullptr;
     ggml_cgraph  * gf   = nullptr;
-    mutable ggml_tensor * output_priority = nullptr;
-    mutable ggml_tensor * output_ids = nullptr;
-    mutable ggml_tensor * output_route_priority = nullptr;
-    mutable ggml_tensor * moe_cache_epoch = nullptr;
 
     llm_graph_context(const llm_graph_params & params);
     virtual ~llm_graph_context() = default;
@@ -1176,7 +1157,6 @@ struct llm_graph_context {
     ggml_tensor * build_inp_pos() const;
     ggml_tensor * build_inp_attn_scale() const;
     ggml_tensor * build_inp_out_ids() const;
-    std::pair<ggml_tensor *, ggml_tensor *> build_inp_moe_cache(int64_t n_route_tokens) const;
     ggml_tensor * build_inp_mean() const;
     ggml_tensor * build_inp_cls() const;
 

@@ -9,7 +9,6 @@
 #include <cstring>
 #include <stdexcept>
 #include <unordered_map>
-#include <unordered_set>
 
 bool llama_moe_cache_is_routed_weight(llm_tensor tensor, const char * suffix) {
     return suffix != nullptr && strcmp(suffix, "weight") == 0 &&
@@ -17,11 +16,18 @@ bool llama_moe_cache_is_routed_weight(llm_tensor tensor, const char * suffix) {
             tensor == LLM_TENSOR_FFN_UP_EXPS || tensor == LLM_TENSOR_FFN_GATE_UP_EXPS);
 }
 
-bool llama_moe_cache_supports_weight(const ggml_tensor * tensor) {
-    return tensor != nullptr && ggml_is_quantized(tensor->type);
+static enum ggml_backend_moe_cache_policy llama_moe_cache_backend_policy(
+        enum llama_moe_cache_policy policy) {
+    switch (policy) {
+        case LLAMA_MOE_CACHE_POLICY_LRU:
+            return GGML_BACKEND_MOE_CACHE_POLICY_LRU;
+    }
+    throw std::runtime_error("MoE expert cache: unknown residency policy");
 }
 
-void llama_moe_cache_validate_model(const llama_model & model, uint32_t n_cache) {
+void llama_moe_cache_validate_model(
+        const llama_model & model, uint32_t n_cache, enum llama_moe_cache_policy policy) {
+    GGML_UNUSED(llama_moe_cache_backend_policy(policy));
     if (model.hparams.n_expert == 0) {
         throw std::runtime_error("MoE expert cache: model has no routed experts");
     }
@@ -34,14 +40,6 @@ void llama_moe_cache_validate_model(const llama_model & model, uint32_t n_cache)
         throw std::runtime_error(
             "MoE expert cache: capacity must remain below the model's total expert count; "
             "omit the option to use ordinary model placement");
-    }
-
-    if (model.n_devices() != 1) {
-        throw std::runtime_error("MoE expert cache: exactly one GPU device is required");
-    }
-
-    if (model.n_gpu_layers() != model.hparams.n_layer_all + 1) {
-        throw std::runtime_error("MoE expert cache: every model layer requires GPU placement");
     }
 }
 
@@ -74,17 +72,19 @@ struct llama_moe_expert_cache::impl {
     const llama_model &                              model;
     const std::vector<ggml_backend_t> &              backends;
     uint32_t                                         n_cache;
+    enum ggml_backend_moe_cache_policy               policy;
     std::vector<std::unique_ptr<group>>              groups;
     std::unordered_map<const ggml_tensor *, group *> by_anchor;
-    std::unordered_set<ggml_backend_t>               pending;
-    ggml_backend_dev_t                               device       = nullptr;
     bool                                             info_printed = false;
-    uint32_t                                         batch_epoch  = 0;
 
-    impl(const llama_model & model, const std::vector<ggml_backend_t> & backends, uint32_t n_cache) :
+    impl(const llama_model & model,
+         const std::vector<ggml_backend_t> & backends,
+         uint32_t n_cache,
+         enum ggml_backend_moe_cache_policy policy) :
         model(model),
         backends(backends),
-        n_cache(n_cache) {}
+        n_cache(n_cache),
+        policy(policy) {}
 
     ggml_backend_t backend_for_layer(int il) const {
         const ggml_backend_dev_t target = model.dev_layer(il);
@@ -102,8 +102,7 @@ struct llama_moe_expert_cache::impl {
                                               ggml_tensor * gate_up) {
         std::vector<ggml_tensor *> result;
         for (ggml_tensor * tensor : { gate_up, up, gate, down }) {
-            if (llama_moe_cache_supports_weight(tensor) &&
-                std::find(result.begin(), result.end(), tensor) == result.end()) {
+            if (tensor != nullptr && std::find(result.begin(), result.end(), tensor) == result.end()) {
                 result.push_back(tensor);
             }
         }
@@ -138,16 +137,15 @@ struct llama_moe_expert_cache::impl {
             throw std::runtime_error("MoE expert cache: the selected backend lacks expert-cache support");
         }
 
-        if (device != nullptr && device != layer_device) {
-            throw std::runtime_error("MoE expert cache: every cached layer requires one backend device");
-        }
-        device = layer_device;
-
         if (source_tensors.size() > GGML_BACKEND_MOE_CACHE_MAX_WEIGHTS) {
             throw std::runtime_error("MoE expert cache: too many routed projections");
         }
 
         for (ggml_tensor * tensor : source_tensors) {
+            if (!api->supports_weight(layer_device, tensor)) {
+                throw std::runtime_error(
+                    "MoE expert cache: backend does not support routed expert weight " + std::string(tensor->name));
+            }
             if (tensor->ne[2] != n_expert || tensor->ne[3] != 1 || tensor->buffer == nullptr ||
                 !ggml_backend_buffer_is_host(tensor->buffer)) {
                 throw std::runtime_error(
@@ -162,7 +160,8 @@ struct llama_moe_expert_cache::impl {
         result->buft     = ggml_backend_get_default_buffer_type(backend);
         result->api      = api;
 
-        const size_t state_size = api->get_state_size(layer_device, n_expert, n_cache, source_tensors.size());
+        const size_t state_size = api->get_state_size(
+            layer_device, policy, n_expert, n_cache, source_tensors.size());
         if (state_size == 0) {
             throw std::runtime_error("MoE expert cache: backend rejected cache configuration");
         }
@@ -208,12 +207,13 @@ struct llama_moe_expert_cache::impl {
             }
 
             result->handle =
-                api->create(backend, result->state, sources.data(), slots.data(), n_expert, n_cache, sources.size());
+                api->create(backend, result->state, sources.data(), slots.data(), policy,
+                            n_expert, n_cache, sources.size());
             if (result->handle == nullptr) {
                 throw std::runtime_error("MoE expert cache: backend failed to create cache handle");
             }
 
-            pending.insert(backend);
+            ggml_backend_synchronize(backend);
             result->buffer_size = ggml_backend_buffer_get_size(result->buffer.get());
         }
 
@@ -245,9 +245,10 @@ struct llama_moe_expert_cache::impl {
 
 llama_moe_expert_cache::llama_moe_expert_cache(const llama_model &                 model,
                                                const std::vector<ggml_backend_t> & backends,
-                                               uint32_t                            n_cache) :
-    pimpl(std::make_unique<impl>(model, backends, n_cache)) {
-    llama_moe_cache_validate_model(model, n_cache);
+                                               uint32_t                            n_cache,
+                                               enum llama_moe_cache_policy         policy) :
+    pimpl(std::make_unique<impl>(model, backends, n_cache, llama_moe_cache_backend_policy(policy))) {
+    llama_moe_cache_validate_model(model, n_cache, policy);
 }
 
 llama_moe_expert_cache::~llama_moe_expert_cache() = default;
@@ -256,8 +257,6 @@ llama_moe_cache_binding llama_moe_expert_cache::bind(ggml_context *       ctx,
                                                      ggml_backend_sched_t sched,
                                                      int                  il,
                                                      ggml_tensor *        ids,
-                                                     ggml_tensor *        token_priority,
-                                                     ggml_tensor *        epoch,
                                                      ggml_tensor *        up,
                                                      ggml_tensor *        gate,
                                                      ggml_tensor *        down,
@@ -272,9 +271,12 @@ llama_moe_cache_binding llama_moe_expert_cache::bind(ggml_context *       ctx,
         return { up, gate, down, gate_up, ids };
     }
 
+    if (ids == nullptr) {
+        throw std::runtime_error("MoE expert cache: routed expert IDs are required");
+    }
+
     ggml_tensor *                     logical_ids = ggml_is_contiguous(ids) ? ids : ggml_cont(ctx, ids);
-    const ggml_backend_moe_cache_plan plan =
-        group->api->build_plan(group->handle, ctx, logical_ids, token_priority, epoch);
+    const ggml_backend_moe_cache_plan plan = group->api->build_plan(group->handle, ctx, logical_ids);
     if (plan.execution == nullptr || plan.selectors == nullptr ||
         !ggml_backend_dev_supports_op(ggml_backend_get_device(group->backend), plan.execution)) {
         throw std::runtime_error("MoE expert cache: backend cannot build route plan");
@@ -289,24 +291,6 @@ llama_moe_cache_binding llama_moe_expert_cache::bind(ggml_context *       ctx,
         impl::cached(group, up), impl::cached(group, gate), impl::cached(group, down), impl::cached(group, gate_up),
         plan.selectors,
     };
-}
-
-void llama_moe_expert_cache::synchronize() {
-    for (ggml_backend_t backend : pimpl->pending) {
-        ggml_backend_synchronize(backend);
-    }
-    pimpl->pending.clear();
-}
-
-void llama_moe_expert_cache::begin_batch() {
-    ++pimpl->batch_epoch;
-    if (pimpl->batch_epoch == 0) {
-        ++pimpl->batch_epoch;
-    }
-}
-
-uint32_t llama_moe_expert_cache::epoch() const {
-    return pimpl->batch_epoch;
 }
 
 void llama_moe_expert_cache::print_info() {

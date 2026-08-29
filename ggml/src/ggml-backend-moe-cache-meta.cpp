@@ -25,6 +25,21 @@ struct ggml_backend_meta_moe_cache {
     ggml_backend_meta_tensor_adapter               selector_adapter;
 };
 
+static bool ggml_backend_meta_moe_cache_supports_weight(
+        ggml_backend_dev_t device, const ggml_tensor * tensor) {
+    if (device == nullptr || ggml_backend_dev_type(device) != GGML_BACKEND_DEVICE_TYPE_META || tensor == nullptr) {
+        return false;
+    }
+    for (size_t index = 0; index < ggml_backend_meta_n_devices(device); ++index) {
+        ggml_backend_dev_t child = ggml_backend_meta_simple_device(device, index);
+        const ggml_backend_moe_cache_i * api = ggml_backend_moe_cache_get_interface(child);
+        if (api == nullptr || !api->supports_weight(child, tensor)) {
+            return false;
+        }
+    }
+    return ggml_backend_meta_n_devices(device) > 0;
+}
+
 static ggml_backend_buffer_type_t ggml_backend_meta_moe_cache_source_buffer_type(ggml_backend_dev_t device) {
     if (device == nullptr || ggml_backend_dev_type(device) != GGML_BACKEND_DEVICE_TYPE_META) {
         return nullptr;
@@ -53,6 +68,7 @@ static ggml_backend_buffer_type_t ggml_backend_meta_moe_cache_source_buffer_type
 }
 
 static size_t ggml_backend_meta_moe_cache_state_size(ggml_backend_dev_t device,
+                                                     enum ggml_backend_moe_cache_policy policy,
                                                      uint32_t           n_expert,
                                                      uint32_t           n_cache,
                                                      uint32_t           n_weights) {
@@ -64,7 +80,7 @@ static size_t ggml_backend_meta_moe_cache_state_size(ggml_backend_dev_t device,
     for (size_t index = 0; index < ggml_backend_meta_n_devices(device); ++index) {
         ggml_backend_dev_t               child = ggml_backend_meta_simple_device(device, index);
         const ggml_backend_moe_cache_i * api   = ggml_backend_moe_cache_get_interface(child);
-        result = std::max(result, api->get_state_size(child, n_expert, n_cache, n_weights));
+        result = std::max(result, api->get_state_size(child, policy, n_expert, n_cache, n_weights));
     }
     return result;
 }
@@ -73,6 +89,7 @@ static ggml_backend_moe_cache_t ggml_backend_meta_moe_cache_create(ggml_backend_
                                                                    ggml_tensor *         state,
                                                                    ggml_tensor * const * source,
                                                                    ggml_tensor * const * slots,
+                                                                   enum ggml_backend_moe_cache_policy policy,
                                                                    uint32_t              n_expert,
                                                                    uint32_t              n_cache,
                                                                    uint32_t              n_weights) {
@@ -110,7 +127,7 @@ static ggml_backend_moe_cache_t ggml_backend_meta_moe_cache_create(ggml_backend_
         const ggml_backend_moe_cache_i * api           = ggml_backend_moe_cache_get_interface(child_device);
         ggml_tensor *                    child_state   = ggml_backend_meta_buffer_simple_tensor(state, index);
         if (api == nullptr || (child_api != nullptr && api != child_api) || child_state == nullptr ||
-            ggml_nbytes(child_state) < api->get_state_size(child_device, n_expert, n_cache, n_weights)) {
+            ggml_nbytes(child_state) < api->get_state_size(child_device, policy, n_expert, n_cache, n_weights)) {
             goto fail;
         }
         child_api = api;
@@ -122,7 +139,8 @@ static ggml_backend_moe_cache_t ggml_backend_meta_moe_cache_create(ggml_backend_
             child_slots[weight]   = ggml_backend_meta_buffer_simple_tensor(slots[weight], index);
         }
         ggml_backend_moe_cache_t handle =
-            api->create(child_backend, child_state, child_sources, child_slots, n_expert, n_cache, n_weights);
+            api->create(child_backend, child_state, child_sources, child_slots, policy,
+                        n_expert, n_cache, n_weights);
         if (handle == nullptr) {
             goto fail;
         }
@@ -194,14 +212,12 @@ static enum ggml_status ggml_backend_meta_moe_cache_materialize_execution(ggml_c
                                                                           size_t         index,
                                                                           void *         userdata) {
     auto * cache = static_cast<ggml_backend_meta_moe_cache *>(userdata);
-    if (cache == nullptr || index >= cache->children.size() || tensor->src[0] == nullptr || tensor->src[1] == nullptr ||
-        tensor->src[2] == nullptr) {
+    if (cache == nullptr || index >= cache->children.size() || tensor->src[0] == nullptr) {
         return GGML_STATUS_FAILED;
     }
 
     const auto & child = cache->children[index];
-    const ggml_backend_moe_cache_plan plan =
-        child.api->build_plan(child.handle, ctx, tensor->src[0], tensor->src[1], tensor->src[2]);
+    const ggml_backend_moe_cache_plan plan = child.api->build_plan(child.handle, ctx, tensor->src[0]);
     if (plan.execution == nullptr || plan.selectors == nullptr || plan.execution->type != tensor->type ||
         !ggml_are_same_shape(plan.execution, tensor)) {
         return GGML_STATUS_FAILED;
@@ -236,11 +252,9 @@ static enum ggml_status ggml_backend_meta_moe_cache_materialize_selector(ggml_co
 
 static ggml_backend_moe_cache_plan ggml_backend_meta_moe_cache_build_plan(ggml_backend_moe_cache_t opaque,
                                                                           ggml_context *           ctx,
-                                                                          ggml_tensor *            ids,
-                                                                          ggml_tensor *            token_priority,
-                                                                          ggml_tensor *            epoch) {
+                                                                          ggml_tensor *            ids) {
     auto * cache = reinterpret_cast<ggml_backend_meta_moe_cache *>(opaque);
-    if (cache == nullptr || ctx == nullptr || ids == nullptr || token_priority == nullptr || epoch == nullptr) {
+    if (cache == nullptr || ctx == nullptr || ids == nullptr) {
         return { nullptr, nullptr };
     }
 
@@ -249,17 +263,15 @@ static ggml_backend_moe_cache_plan ggml_backend_meta_moe_cache_build_plan(ggml_b
         return { nullptr, nullptr };
     }
 
-    ggml_tensor * args[4 + GGML_BACKEND_MOE_CACHE_MAX_WEIGHTS] = {};
+    ggml_tensor * args[2 + GGML_BACKEND_MOE_CACHE_MAX_WEIGHTS] = {};
     args[0]                                                    = ids;
-    args[1]                                                    = token_priority;
-    args[2]                                                    = epoch;
-    args[3]                                                    = cache->state;
+    args[1]                                                    = cache->state;
     for (uint32_t weight = 0; weight < cache->n_weights; ++weight) {
-        args[4 + weight] = cache->slots[weight];
+        args[2 + weight] = cache->slots[weight];
     }
     ggml_tensor * execution =
         ggml_custom_4d(ctx, layout.execution_type, layout.execution_ne[0], layout.execution_ne[1],
-                       layout.execution_ne[2], layout.execution_ne[3], args, 4 + cache->n_weights, nullptr, 1, nullptr);
+                       layout.execution_ne[2], layout.execution_ne[3], args, 2 + cache->n_weights, nullptr, 1, nullptr);
     ggml_tensor * selectors =
         ggml_view_4d(ctx, execution, layout.selectors_ne[0], layout.selectors_ne[1], layout.selectors_ne[2],
                      layout.selectors_ne[3], layout.selectors_nb[1], layout.selectors_nb[2], layout.selectors_nb[3],
@@ -274,6 +286,7 @@ static ggml_backend_moe_cache_plan ggml_backend_meta_moe_cache_build_plan(ggml_b
 }
 
 static const ggml_backend_moe_cache_i ggml_backend_meta_moe_cache_interface = {
+    ggml_backend_meta_moe_cache_supports_weight,
     ggml_backend_meta_moe_cache_source_buffer_type,
     ggml_backend_meta_moe_cache_state_size,
     ggml_backend_meta_moe_cache_create,

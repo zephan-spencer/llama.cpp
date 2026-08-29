@@ -1684,15 +1684,16 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
         mparams.devices = params.devices.data();
     }
 
-    mparams.n_gpu_layers    = params.n_gpu_layers;
+    mparams.n_gpu_layers        = params.n_gpu_layers;
     mparams.n_moe_cache_experts = params.n_moe_cache_experts;
-    mparams.main_gpu        = params.main_gpu;
-    mparams.split_mode      = params.split_mode;
-    mparams.load_mode       = params.load_mode;
-    mparams.tensor_split    = params.tensor_split;
-    mparams.check_tensors   = params.check_tensors;
-    mparams.use_extra_bufts = !params.no_extra_bufts;
-    mparams.no_host         = params.no_host;
+    mparams.moe_cache_policy    = params.moe_cache_policy;
+    mparams.main_gpu            = params.main_gpu;
+    mparams.split_mode          = params.split_mode;
+    mparams.load_mode           = params.load_mode;
+    mparams.tensor_split        = params.tensor_split;
+    mparams.check_tensors       = params.check_tensors;
+    mparams.use_extra_bufts     = !params.no_extra_bufts;
+    mparams.no_host             = params.no_host;
 
     if (params.kv_overrides.empty()) {
         mparams.kv_overrides = NULL;

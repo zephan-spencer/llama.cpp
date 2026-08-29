@@ -426,7 +426,7 @@ llama_context::llama_context(
 
         if (model.n_moe_cache_experts() > 0) {
             moe_cache = std::make_unique<llama_moe_expert_cache>(
-                model, backend_ptrs, model.n_moe_cache_experts());
+                model, backend_ptrs, model.n_moe_cache_experts(), model.moe_cache_policy());
         }
 
         // TODO: move these checks to ggml_backend_sched
@@ -708,7 +708,6 @@ void llama_context::sched_reserve() {
             __func__, (t_end_us - t_start_us)/1000.0, ggml_backend_sched_get_n_copies(sched.get()));
 
     if (moe_cache) {
-        moe_cache->synchronize();
         moe_cache->print_info();
     }
 }
@@ -1470,10 +1469,6 @@ int llama_context::encode(const llama_batch & batch_inp) {
     //       ref: https://github.com/ggml-org/llama.cpp/pull/12181#issuecomment-2730451223
     cparams.causal_attn = false;
 
-    if (moe_cache) {
-        moe_cache->begin_batch();
-    }
-
     ggml_status status;
     const auto * res = process_ubatch(ubatch, LLM_GRAPH_TYPE_ENCODER, nullptr, status);
 
@@ -1747,10 +1742,6 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
     // handle any pending shifts/copies
     memory_update(false);
-
-    if (moe_cache) {
-        moe_cache->begin_batch();
-    }
 
     llama_memory_context_ptr mctx;
 
@@ -2495,10 +2486,6 @@ llm_graph_params llama_context::graph_params(
 ggml_status llama_context::graph_compute(
             ggml_cgraph * gf,
                    bool   batched) {
-    if (moe_cache) {
-        moe_cache->synchronize();
-    }
-
     int n_threads        = batched ? cparams.n_threads_batch : cparams.n_threads;
     ggml_threadpool_t tp = batched ? threadpool_batch        : threadpool;
 

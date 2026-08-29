@@ -63,6 +63,7 @@ test parameters:
   -ngl, --n-gpu-layers <n>                  (default: -1)
   -ncmoe, --n-cpu-moe <n>                   (default: 0)
   --moe-cache-experts <n>                   keep routed expert weights in host memory and cache n logical experts per MoE layer; n must be positive and smaller than the model's expert count; disabled by default
+  --moe-cache-policy <lru>                  expert cache residency policy (default: lru)
   -sm, --split-mode <none|layer|row|tensor> (default: layer)
   -mg, --main-gpu <i>                       (default: 0)
   -nkvo, --no-kv-offload <0|1>              (default: 0)
