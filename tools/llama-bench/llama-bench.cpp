@@ -278,6 +278,19 @@ static const char * moe_cache_policy_str(llama_moe_cache_policy policy) {
     return "unknown";
 }
 
+static const char * lazy_mode_str(llama_lazy_mode mode) {
+    switch (mode) {
+        case LLAMA_LAZY_MODE_OFF:
+            return "off";
+        case LLAMA_LAZY_MODE_AUTO:
+            return "auto";
+        case LLAMA_LAZY_MODE_ON:
+            return "on";
+        default:
+            GGML_ABORT("invalid tensor read lazy mode");
+    }
+}
+
 static std::string pair_str(const std::pair<int, int> & p) {
     static char buf[32];
     snprintf(buf, sizeof(buf), "%d,%d", p.first, p.second);
@@ -350,6 +363,7 @@ struct cmd_params {
     llama_moe_cache_policy           moe_cache_policy;
     std::vector<llama_split_mode>    split_mode;
     std::vector<llama_load_mode>     load_mode;
+    std::vector<llama_lazy_mode>     lazy_mode;
     std::vector<int>                 main_gpu;
     std::vector<bool>                no_kv_offload;
     std::vector<llama_flash_attn_type> flash_attn;
@@ -396,6 +410,7 @@ static const cmd_params cmd_params_defaults = {
     /* moe_cache_policy     */ LLAMA_MOE_CACHE_POLICY_LRU,
     /* split_mode           */ { LLAMA_SPLIT_MODE_LAYER },
     /* load_mode            */ { LLAMA_LOAD_MODE_AUTO },
+    /* lazy_mode            */ { LLAMA_LAZY_MODE_AUTO },
     /* main_gpu             */ { 0 },
     /* no_kv_offload        */ { false },
     /* flash_attn           */ { LLAMA_FLASH_ATTN_TYPE_AUTO },
@@ -473,6 +488,7 @@ static void print_usage(int /* argc */, char ** argv) {
     printf("  -fa, --flash-attn <on|off|auto>                   (default: %s)\n", join(transform_to_str(cmd_params_defaults.flash_attn, llama_flash_attn_type_name), ",").c_str());
     printf("  -dev, --device <dev0/dev1/...>                    (default: auto)\n");
     printf("  -lm, --load-mode <auto|none|mmap|mlock|mmap+mlock|dio> (default: %s)\n", join(transform_to_str(cmd_params_defaults.load_mode, llama_load_mode_name), ",").c_str());
+    printf("  --tensor-read-lazy <on|auto|off>                  (default: %s)\n", join(transform_to_str(cmd_params_defaults.lazy_mode, lazy_mode_str), ",").c_str());
     printf("  -mmp, --mmap <0|1>                                (DEPRECATED IN FAVOUR OF --load-mode)\n");
     printf("  -dio, --direct-io <0|1>                           (DEPRECATED IN FAVOUR OF --load-mode)\n");
     printf("  -embd, --embeddings <0|1>                         (default: %s)\n", join(cmd_params_defaults.embeddings, ",").c_str());
@@ -819,6 +835,32 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                     break;
                 }
                 params.load_mode.insert(params.load_mode.end(), modes.begin(), modes.end());
+            } else if (arg == "--tensor-read-lazy") {
+                if (++i >= argc) {
+                    invalid_param = true;
+                    break;
+                }
+                auto p = string_split<std::string>(argv[i], split_delim);
+
+                std::vector<llama_lazy_mode> modes;
+                for (const auto & m : p) {
+                    llama_lazy_mode mode;
+                    if (m == "on") {
+                        mode = LLAMA_LAZY_MODE_ON;
+                    } else if (m == "auto") {
+                        mode = LLAMA_LAZY_MODE_AUTO;
+                    } else if (m == "off") {
+                        mode = LLAMA_LAZY_MODE_OFF;
+                    } else {
+                        invalid_param = true;
+                        break;
+                    }
+                    modes.push_back(mode);
+                }
+                if (invalid_param) {
+                    break;
+                }
+                params.lazy_mode.insert(params.lazy_mode.end(), modes.begin(), modes.end());
             } else if (arg == "-mg" || arg == "--main-gpu") {
                 if (++i >= argc) {
                     invalid_param = true;
@@ -1173,6 +1215,9 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
     if (params.load_mode.empty()) {
         params.load_mode = cmd_params_defaults.load_mode;
     }
+    if (params.lazy_mode.empty()) {
+        params.lazy_mode = cmd_params_defaults.lazy_mode;
+    }
     if (params.main_gpu.empty()) {
         params.main_gpu = cmd_params_defaults.main_gpu;
     }
@@ -1241,6 +1286,7 @@ struct cmd_params_instance {
     llama_moe_cache_policy moe_cache_policy;
     llama_split_mode   split_mode;
     llama_load_mode    load_mode;
+    llama_lazy_mode    lazy_mode;
     int                main_gpu;
     bool               no_kv_offload;
     llama_flash_attn_type flash_attn;
@@ -1267,6 +1313,7 @@ struct cmd_params_instance {
         }
         mparams.split_mode    = split_mode;
         mparams.load_mode     = load_mode;
+        mparams.lazy_mode     = lazy_mode;
         mparams.main_gpu      = main_gpu;
         mparams.tensor_split  = tensor_split.data();
         mparams.no_host       = no_host;
@@ -1297,7 +1344,7 @@ struct cmd_params_instance {
             merged.reserve(merged.size() + (size_t) n_cpu_moe + 1);
 
             for (int i = 0; i < n_cpu_moe; ++i) {
-                patterns.push_back(llm_ffn_exps_block_regex(i));
+                patterns.push_back(llm_ffn_block_regex(i, LLM_FFN_EXPS_REGEX));
                 merged.push_back({ patterns.back().c_str(),
                                 ggml_backend_cpu_buffer_type() });
             }
@@ -1316,7 +1363,8 @@ struct cmd_params_instance {
                moe_cache_policy == other.moe_cache_policy &&
                split_mode == other.split_mode &&
                main_gpu == other.main_gpu && tensor_split == other.tensor_split &&
-               load_mode == other.load_mode && devices == other.devices && no_host == other.no_host &&
+               load_mode == other.load_mode && lazy_mode == other.lazy_mode &&
+               devices == other.devices && no_host == other.no_host &&
                vec_tensor_buft_override_equal(tensor_buft_overrides, other.tensor_buft_overrides);
     }
 
@@ -1351,6 +1399,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
     for (const auto & ncache : params.n_moe_cache_experts)
     for (const auto & sm : params.split_mode)
     for (const auto & lm : params.load_mode)
+    for (const auto & lzm : params.lazy_mode)
     for (const auto & mg : params.main_gpu)
     for (const auto & devs : params.devices)
     for (const auto & ts : params.tensor_split)
@@ -1392,6 +1441,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .moe_cache_policy      = */ params.moe_cache_policy,
                 /* .split_mode            = */ sm,
                 /* .load_mode             = */ lm,
+                /* .lazy_mode             = */ lzm,
                 /* .main_gpu              = */ mg,
                 /* .no_kv_offload         = */ nkvo,
                 /* .flash_attn            = */ fa,
@@ -1430,6 +1480,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .moe_cache_policy      = */ params.moe_cache_policy,
                 /* .split_mode            = */ sm,
                 /* .load_mode             = */ lm,
+                /* .lazy_mode             = */ lzm,
                 /* .main_gpu              = */ mg,
                 /* .no_kv_offload         = */ nkvo,
                 /* .flash_attn            = */ fa,
@@ -1468,6 +1519,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .moe_cache_policy      = */ params.moe_cache_policy,
                 /* .split_mode            = */ sm,
                 /* .load_mode             = */ lm,
+                /* .lazy_mode             = */ lzm,
                 /* .main_gpu              = */ mg,
                 /* .no_kv_offload         = */ nkvo,
                 /* .flash_attn            = */ fa,
@@ -1511,6 +1563,7 @@ struct test {
     llama_moe_cache_policy   moe_cache_policy;
     llama_split_mode         split_mode;
     llama_load_mode          load_mode;
+    llama_lazy_mode          lazy_mode;
     int                      main_gpu;
     bool                     no_kv_offload;
     llama_flash_attn_type    flash_attn;
@@ -1552,6 +1605,7 @@ struct test {
         moe_cache_policy = inst.moe_cache_policy;
         split_mode     = inst.split_mode;
         load_mode      = inst.load_mode;
+        lazy_mode      = inst.lazy_mode;
         main_gpu       = inst.main_gpu;
         no_kv_offload  = inst.no_kv_offload;
         flash_attn     = inst.flash_attn;
@@ -1618,10 +1672,10 @@ struct test {
             "model_filename", "model_type",     "model_size",    "model_n_params", "n_batch",
             "n_ubatch",       "n_threads",      "cpu_mask",      "cpu_strict",     "poll",
             "type_k",         "type_v",         "n_gpu_layers",  "n_cpu_moe",      "n_moe_cache_experts",
-            "moe_cache_policy",
-            "split_mode",     "main_gpu",       "no_kv_offload", "flash_attn",      "devices",
-            "tensor_split",
-            "tensor_buft_overrides",            "load_mode",     "embeddings",
+            "moe_cache_policy",                  "split_mode",
+            "main_gpu",       "no_kv_offload",  "flash_attn",    "devices",        "tensor_split",
+            "tensor_buft_overrides",            "load_mode",     "lazy_mode",
+            "embeddings",
             "no_op_offload",  "no_host",        "fit_target",    "fit_min_ctx",
             "n_prompt",       "n_gen",          "n_depth",
             "test_time",      "avg_ns",         "stddev_ns",     "avg_ts",         "stddev_ts"
@@ -1647,7 +1701,7 @@ struct test {
         if (field == "avg_ts" || field == "stddev_ts") {
             return FLOAT;
         }
-        if (field == "load_mode") {
+        if (field == "load_mode" || field == "lazy_mode") {
             return STRING;
         }
         return STRING;
@@ -1719,6 +1773,7 @@ struct test {
                                             tensor_split_str,
                                             tensor_buft_overrides_str,
                                             llama_load_mode_name(load_mode),
+                                            lazy_mode_str(lazy_mode),
                                             std::to_string(embeddings),
                                             std::to_string(no_op_offload),
                                             std::to_string(no_host),
@@ -2036,6 +2091,9 @@ struct markdown_printer : public printer {
         }
         if (params.load_mode.size() > 1 || params.load_mode != cmd_params_defaults.load_mode) {
             fields.emplace_back("load_mode");
+        }
+        if (params.lazy_mode.size() > 1 || params.lazy_mode != cmd_params_defaults.lazy_mode) {
+            fields.emplace_back("lazy_mode");
         }
         if (params.embeddings.size() > 1 || params.embeddings != cmd_params_defaults.embeddings) {
             fields.emplace_back("embeddings");
