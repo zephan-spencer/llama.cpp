@@ -10775,15 +10775,15 @@ static bool run_moe_cache_case(ggml_backend_t backend, const ggml_backend_moe_ca
         return false;
     }
 
-    const ggml_backend_moe_cache_plan plan = api->build_plan(cache, graph_ctx.get(), ids);
-    if (!plan.execution || !plan.selectors) {
+    ggml_tensor * plan = api->build_plan(cache, graph_ctx.get(), ids);
+    if (!plan) {
         api->destroy(cache);
         printf("  MOE_CACHE(type=%s): plan creation failed\n", ggml_type_name(type));
         return false;
     }
 
     ggml_tensor * cached_out = ggml_mul_mat_id(graph_ctx.get(), slots, input, ids);
-    cached_out->src[3]        = plan.selectors;
+    cached_out->src[3]        = plan;
     ggml_tensor * full_out    = ggml_mul_mat_id(graph_ctx.get(), full, input, ids);
 
     ggml_cgraph * graph = ggml_new_graph(graph_ctx.get());
@@ -10799,25 +10799,17 @@ static bool run_moe_cache_case(ggml_backend_t backend, const ggml_backend_moe_ca
 
     struct route_case {
         std::array<int32_t, n_used> ids;
-        std::array<int32_t, n_used> selectors;
     };
     const route_case cases[] = {
-        { { 5, 2, 7, 1 }, {  0, 1, 2, -2 } },
-        { { 5, 1, 5, 1 }, {  0, 1, 0,  1 } },
-        { { 2, 7, 2, 7 }, {  0, 2, 0,  2 } },
+        { { 5, 2, 7, 1 } },
+        { { 5, 1, 5, 1 } },
+        { { 2, 7, 2, 7 } },
     };
 
     bool ok = true;
     for (const route_case & test : cases) {
         ggml_backend_tensor_set(ids, test.ids.data(), 0, sizeof(test.ids));
         if (ggml_backend_graph_compute(backend, graph) != GGML_STATUS_SUCCESS) {
-            ok = false;
-            break;
-        }
-
-        std::array<int32_t, n_used> selectors;
-        ggml_backend_tensor_get(plan.selectors, selectors.data(), 0, sizeof(selectors));
-        if (selectors != test.selectors) {
             ok = false;
             break;
         }

@@ -22,6 +22,7 @@ struct llama_layer;
 struct llama_memory_context_i;
 
 class llama_kv_cache_context;
+class llama_moe_cache_layer;
 class llama_kv_cache_dsa_context;
 class llama_kv_cache_dsa_iswa_context;
 class llama_kv_cache_msa_context;
@@ -1061,10 +1062,9 @@ struct llm_graph_context {
     // do mat_mul_id, while optionally apply lora and per-expert scale
     ggml_tensor * build_lora_mm_id(
               ggml_tensor * w,           // ggml_tensor * as
-              ggml_tensor * w_compute,
               ggml_tensor * cur,         // ggml_tensor * b
               ggml_tensor * ids,
-              ggml_tensor * ids_compute,
+        const llama_moe_cache_layer * cache_layer,
               ggml_tensor * w_s = nullptr) const;
 
     ggml_tensor * build_norm(

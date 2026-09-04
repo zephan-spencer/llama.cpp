@@ -1666,12 +1666,16 @@ static void ggml_cuda_mul_mat_cublas(ggml_backend_cuda_context & ctx, const ggml
 }
 
 static bool ggml_cuda_get_expert_source_view(
-        const ggml_tensor * src0, const ggml_tensor * ids_source, ggml_cuda_expert_source_view & view) {
-    if (ids_source == nullptr) {
+        const ggml_tensor * src0,
+        const ggml_tensor * logical_ids,
+        const ggml_tensor * plan,
+        ggml_cuda_expert_source_view & view) {
+    if (plan == nullptr) {
         return false;
     }
 
-    GGML_ASSERT(ids_source->type == GGML_TYPE_I32);
+    GGML_ASSERT(logical_ids->type == GGML_TYPE_I32);
+    GGML_ASSERT(plan->type == GGML_TYPE_I32);
     GGML_ASSERT(src0->extra != nullptr);
     const auto * source = static_cast<const ggml_backend_cuda_expert_source *>(src0->extra);
     GGML_ASSERT(source->magic == GGML_CUDA_EXPERT_SOURCE_MAGIC);
@@ -1681,23 +1685,21 @@ static bool ggml_cuda_get_expert_source_view(
 
     const size_t type_size = ggml_type_size(src0->type);
     GGML_ASSERT(source->weight->expert_size % type_size == 0);
-    view.selectors = static_cast<const int32_t *>(ids_source->data);
-    view.selector_stride = ids_source->nb[1] / ggml_type_size(ids_source->type);
-    view.selector_width = ids_source->ne[0];
+    const auto * binding = static_cast<const ggml_backend_cuda_expert_plan_binding *>(plan->extra);
+    GGML_ASSERT(binding != nullptr);
+    GGML_ASSERT(binding->magic == GGML_CUDA_EXPERT_PLAN_MAGIC);
+    GGML_ASSERT(binding->cache != nullptr);
+    GGML_ASSERT(binding->cache == source->cache);
+    const auto & desc = binding->cache->desc;
+    GGML_ASSERT(desc.n_expert == source->n_expert);
+    const auto layout = ggml_cuda_expert_cache_route_layout(ggml_nelements(logical_ids), desc.n_expert);
+    const char * data = static_cast<const char *>(plan->data);
+    view.selectors = reinterpret_cast<const int32_t *>(data + layout.selectors_offset);
+    view.selector_stride = logical_ids->ne[0];
+    view.selector_width = logical_ids->ne[0];
     view.host_data = static_cast<const char *>(source->weight->device_data) + source->weight->host_offset;
     view.host_stride = source->weight->expert_size / type_size;
     view.n_expert = source->n_expert;
-    const auto * plan = static_cast<const ggml_backend_cuda_expert_plan_binding *>(ids_source->extra);
-    if (plan == nullptr) {
-        return true;
-    }
-    GGML_ASSERT(plan->magic == GGML_CUDA_EXPERT_PLAN_MAGIC);
-    GGML_ASSERT(plan->cache != nullptr);
-    GGML_ASSERT(plan->cache == source->cache);
-    const auto & desc = plan->cache->desc;
-    GGML_ASSERT(desc.n_expert == source->n_expert);
-    const auto layout = ggml_cuda_expert_cache_route_layout(ggml_nelements(ids_source), desc.n_expert);
-    const char * data = static_cast<const char *>(ids_source->data);
     view.route_ids = reinterpret_cast<const int32_t *>(data + layout.route_ids_offset);
     view.route_bounds = reinterpret_cast<const int32_t *>(data + layout.route_bounds_offset);
     view.route_tile_bounds = reinterpret_cast<int32_t *>(const_cast<char *>(data) + layout.route_tile_bounds_offset);
@@ -1952,10 +1954,10 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
     const ggml_tensor * ids  = dst->src[2];
-    const ggml_tensor * ids_source = dst->src[3];
+    const ggml_tensor * plan = dst->src[3];
     ggml_cuda_expert_source_view source_view = {};
     const ggml_cuda_expert_source_view * source =
-        ggml_cuda_get_expert_source_view(src0, ids_source, source_view) ? &source_view : nullptr;
+        ggml_cuda_get_expert_source_view(src0, ids, plan, source_view) ? &source_view : nullptr;
 
     if (source != nullptr) {
         GGML_ASSERT(ggml_is_quantized(src0->type));

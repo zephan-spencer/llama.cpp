@@ -24,7 +24,7 @@ The first backend is ROCm/HIP. It supports one HIP device and the tensor-paralle
 
 The model loader asks the backend whether each routed weight can use the cache. It then places eligible full weights in the backend's mapped host buffer. Other weights follow the normal loader path.
 
-The shared graph builder makes one call to `llama_moe_expert_cache::bind` for a routed layer. The call returns cached projection tensors and selector IDs. The rest of the graph keeps using `MUL_MAT_ID`.
+The shared graph builder asks `llama_moe_expert_cache` for a graph-scoped layer operation. The operation accepts a logical routed weight and input and builds the corresponding `MUL_MAT_ID`. Cache slots, route plans, and backend bindings remain inside the cache module.
 
 The backend cache interface owns these details:
 
@@ -50,10 +50,7 @@ The llama graph does not read or change backend cache state.
 
 `create` binds one state tensor, one or more full source tensors, matching GPU slot tensors, a policy, and cache sizes. One handle covers all routed projections in one layer. All projections share the same expert-to-slot map.
 
-`build_plan(handle, context, logical_ids)` returns two graph tensors:
-
-- `execution` updates residency, fills slots, and saves the route plan.
-- `selectors` tells cached matrix code where each route's weight lives.
+`build_plan(handle, context, logical_ids)` returns one opaque graph tensor. Computing it updates residency, fills slots, and saves the backend's route plan. Cached matrix code consumes that tensor together with the logical IDs.
 
 The plan is built once per routed layer and physical batch. Gate, up, gate-up, and down operations share it.
 
@@ -69,7 +66,7 @@ A routed weight has one expert in dimension two and uses `ne[3] = 1`. Each exper
 
 A slot tensor keeps the source type, row shape, and expert stride. Dimension two changes from the model expert count to the cache size.
 
-Selectors have the same shape as logical IDs:
+The backend's internal selectors use the same route order as logical IDs:
 
 ```text
 selector >= 0 : GPU cache slot
@@ -134,7 +131,7 @@ logical route IDs
     -> route weights and reduction
 ```
 
-The selector tensor links cached `MUL_MAT_ID` work to its plan. The HIP dispatcher detects this link once. Normal `MUL_MAT_ID` uses the normal dispatch. Cached work uses the cache source dispatch.
+The opaque plan tensor links cached `MUL_MAT_ID` work to its cache update. The HIP dispatcher detects this link once. Normal `MUL_MAT_ID` uses the normal dispatch. Cached work uses the cache source dispatch.
 
 Mapped host addresses stay valid for the context lifetime. Host overflow routes read the full expert slice from that mapped storage.
 
@@ -154,6 +151,6 @@ These checks happen during model or context setup. A cache request does not sile
 
 ## Tests
 
-The shared backend operation test uses the public cache interface. HIP cases cover Q4_K, Q5_K, and MXFP4 weights. They check empty-slot order, first-route order, duplicate routes, full-cache overflow, batch pinning, LRU eviction, graph reuse, and numerical results against full GPU weights.
+The shared backend operation test uses the public cache interface. HIP cases cover Q4_K, Q5_K, and MXFP4 weights. Across repeated route patterns and graph reuse, they compare cached numerical results with full GPU weights.
 
 The normal `MUL_MAT_ID` test set continues to cover the standard path.

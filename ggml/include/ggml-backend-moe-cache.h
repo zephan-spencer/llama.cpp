@@ -14,18 +14,9 @@ extern "C" {
 
     #define GGML_BACKEND_MOE_CACHE_MAX_WEIGHTS 4
 
-    struct ggml_backend_moe_cache_plan {
-        struct ggml_tensor * selectors;
-        struct ggml_tensor * execution;
-    };
-
     struct ggml_backend_moe_cache_plan_layout {
-        enum ggml_type execution_type;
-        int64_t        execution_ne[GGML_MAX_DIMS];
-        enum ggml_type selectors_type;
-        int64_t        selectors_ne[GGML_MAX_DIMS];
-        size_t         selectors_nb[GGML_MAX_DIMS];
-        size_t         selectors_offset;
+        enum ggml_type type;
+        int64_t        ne[GGML_MAX_DIMS];
     };
 
     struct ggml_backend_moe_cache_i {
@@ -51,7 +42,7 @@ extern "C" {
             ggml_backend_moe_cache_t cache,
             const struct ggml_tensor * logical_ids,
             struct ggml_backend_moe_cache_plan_layout * layout);
-        struct ggml_backend_moe_cache_plan (*build_plan)(
+        struct ggml_tensor * (*build_plan)(
             ggml_backend_moe_cache_t cache,
             struct ggml_context * ctx,
             struct ggml_tensor * logical_ids);

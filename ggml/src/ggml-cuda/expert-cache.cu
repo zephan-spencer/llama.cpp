@@ -229,30 +229,24 @@ static bool ggml_backend_cuda_moe_cache_get_plan_layout(
     const auto route_layout = ggml_cuda_expert_cache_route_layout(ggml_nelements(ids), cache->desc.n_expert);
 
     *result                 = {};
-    result->execution_type  = GGML_TYPE_I32;
-    result->execution_ne[0] = route_layout.size / sizeof(int32_t);
-    result->execution_ne[1] = 1;
-    result->execution_ne[2] = 1;
-    result->execution_ne[3] = 1;
-    result->selectors_type  = GGML_TYPE_I32;
-    for (int i = 0; i < GGML_MAX_DIMS; ++i) {
-        result->selectors_ne[i] = ids->ne[i];
-        result->selectors_nb[i] = ids->nb[i];
-    }
-    result->selectors_offset = route_layout.selectors_offset;
+    result->type  = GGML_TYPE_I32;
+    result->ne[0] = route_layout.size / sizeof(int32_t);
+    result->ne[1] = 1;
+    result->ne[2] = 1;
+    result->ne[3] = 1;
     return true;
 }
 
-static ggml_backend_moe_cache_plan ggml_backend_cuda_moe_cache_build_plan(ggml_backend_moe_cache_t cache,
-                                                                          ggml_context *           ctx,
-                                                                          ggml_tensor *            ids) {
+static ggml_tensor * ggml_backend_cuda_moe_cache_build_plan(ggml_backend_moe_cache_t cache,
+                                                            ggml_context *           ctx,
+                                                            ggml_tensor *            ids) {
     if (cache == nullptr || ctx == nullptr || ids == nullptr || ids->type != GGML_TYPE_I32) {
-        return { nullptr, nullptr };
+        return nullptr;
     }
 
     ggml_backend_moe_cache_plan_layout layout;
     if (!ggml_backend_cuda_moe_cache_get_plan_layout(cache, ids, &layout)) {
-        return { nullptr, nullptr };
+        return nullptr;
     }
 
     ggml_tensor * args[2 + GGML_BACKEND_MOE_CACHE_MAX_WEIGHTS] = {};
@@ -261,14 +255,10 @@ static ggml_backend_moe_cache_plan ggml_backend_cuda_moe_cache_build_plan(ggml_b
     for (uint32_t i = 0; i < cache->desc.n_weights; ++i) {
         args[2 + i] = cache->slots[i];
     }
-    auto * execution = ggml_custom_4d(ctx, layout.execution_type, layout.execution_ne[0], layout.execution_ne[1],
-                                      layout.execution_ne[2], layout.execution_ne[3], args,
-                                      2 + cache->desc.n_weights, nullptr, 1, &cache->desc);
-    auto * selectors = ggml_view_4d(ctx, execution, layout.selectors_ne[0], layout.selectors_ne[1],
-                                    layout.selectors_ne[2], layout.selectors_ne[3], layout.selectors_nb[1],
-                                    layout.selectors_nb[2], layout.selectors_nb[3], layout.selectors_offset);
-    selectors->extra = &cache->plan_binding;
-    return { selectors, execution };
+    auto * plan = ggml_custom_4d(ctx, layout.type, layout.ne[0], layout.ne[1], layout.ne[2], layout.ne[3], args,
+                                 2 + cache->desc.n_weights, nullptr, 1, &cache->desc);
+    plan->extra = &cache->plan_binding;
+    return plan;
 }
 
 static const ggml_backend_moe_cache_i ggml_backend_cuda_moe_cache_interface = {

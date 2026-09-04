@@ -331,13 +331,11 @@ static size_t ggml_backend_meta_buffer_type_get_alloc_size(ggml_backend_buffer_t
 }
 
 static bool ggml_backend_meta_buffer_type_is_host(ggml_backend_buffer_type_t buft) {
-    const size_t n_simple_bufts = ggml_backend_meta_buft_n_bufts(buft);
-    for (size_t i = 0; i < n_simple_bufts; i++) {
-        if (!ggml_backend_buft_is_host(ggml_backend_meta_buft_simple_buft(buft, i))) {
-            return false;
-        }
-    }
-    return true;
+    // Meta buffers do not expose directly addressable storage: get_base() and
+    // tensor data are sentinel addresses. Even when every child buffer is host
+    // accessible, callers must use the buffer interface to access their data.
+    GGML_UNUSED(buft);
+    return false;
 }
 
 static const struct ggml_backend_buffer_type_i ggml_backend_meta_buffer_type_iface = {

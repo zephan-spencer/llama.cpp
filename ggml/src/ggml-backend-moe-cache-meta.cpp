@@ -17,12 +17,7 @@ struct ggml_backend_meta_moe_cache {
     uint32_t                                       n_weights;
     std::vector<ggml_tensor *>                     slots;
     std::vector<ggml_backend_meta_moe_cache_child> children;
-    // The physical cache owns this opaque association.  Keep one per child
-    // here so selector materialization does not depend on the execution
-    // tensor's extra field or on view initialization order.
-    std::vector<void *>                             selector_bindings;
-    ggml_backend_meta_tensor_adapter               execution_adapter;
-    ggml_backend_meta_tensor_adapter               selector_adapter;
+    ggml_backend_meta_tensor_adapter               plan_adapter;
 };
 
 static bool ggml_backend_meta_moe_cache_supports_weight(
@@ -101,8 +96,7 @@ static ggml_backend_moe_cache_t ggml_backend_meta_moe_cache_create(ggml_backend_
     for (uint32_t weight = 0; weight < n_weights; ++weight) {
         if (source[weight] == nullptr || slots[weight] == nullptr || source[weight]->buffer == nullptr ||
             slots[weight]->buffer == nullptr || !ggml_backend_buffer_is_meta(source[weight]->buffer) ||
-            !ggml_backend_buffer_is_meta(slots[weight]->buffer) ||
-            !ggml_backend_buffer_is_host(source[weight]->buffer)) {
+            !ggml_backend_buffer_is_meta(slots[weight]->buffer)) {
             return nullptr;
         }
     }
@@ -120,7 +114,6 @@ static ggml_backend_moe_cache_t ggml_backend_meta_moe_cache_create(ggml_backend_
 
     const ggml_backend_moe_cache_i * child_api = nullptr;
     cache->children.reserve(n_backends);
-    cache->selector_bindings.resize(n_backends);
     for (size_t index = 0; index < n_backends; ++index) {
         ggml_backend_t                   child_backend = ggml_backend_meta_simple_backend(backend, index);
         ggml_backend_dev_t               child_device  = ggml_backend_get_device(child_backend);
@@ -170,14 +163,11 @@ static void ggml_backend_meta_moe_cache_destroy(ggml_backend_moe_cache_t opaque)
 
 static bool ggml_backend_meta_moe_cache_layouts_equal(const ggml_backend_moe_cache_plan_layout & left,
                                                       const ggml_backend_moe_cache_plan_layout & right) {
-    if (left.execution_type != right.execution_type || left.selectors_type != right.selectors_type ||
-        left.selectors_offset != right.selectors_offset) {
+    if (left.type != right.type) {
         return false;
     }
     for (int dimension = 0; dimension < GGML_MAX_DIMS; ++dimension) {
-        if (left.execution_ne[dimension] != right.execution_ne[dimension] ||
-            left.selectors_ne[dimension] != right.selectors_ne[dimension] ||
-            left.selectors_nb[dimension] != right.selectors_nb[dimension]) {
+        if (left.ne[dimension] != right.ne[dimension]) {
             return false;
         }
     }
@@ -207,60 +197,41 @@ static bool ggml_backend_meta_moe_cache_get_plan_layout(ggml_backend_moe_cache_t
     return true;
 }
 
-static enum ggml_status ggml_backend_meta_moe_cache_materialize_execution(ggml_context * ctx,
-                                                                          ggml_tensor *  tensor,
-                                                                          size_t         index,
-                                                                          void *         userdata) {
+static enum ggml_status ggml_backend_meta_moe_cache_materialize_plan(ggml_context * ctx,
+                                                                     ggml_tensor *  tensor,
+                                                                     size_t         index,
+                                                                     void *         userdata) {
     auto * cache = static_cast<ggml_backend_meta_moe_cache *>(userdata);
     if (cache == nullptr || index >= cache->children.size() || tensor->src[0] == nullptr) {
         return GGML_STATUS_FAILED;
     }
 
     const auto & child = cache->children[index];
-    const ggml_backend_moe_cache_plan plan = child.api->build_plan(child.handle, ctx, tensor->src[0]);
-    if (plan.execution == nullptr || plan.selectors == nullptr || plan.execution->type != tensor->type ||
-        !ggml_are_same_shape(plan.execution, tensor)) {
-        return GGML_STATUS_FAILED;
-    }
-    if (plan.selectors->extra == nullptr) {
+    ggml_tensor * plan = child.api->build_plan(child.handle, ctx, tensor->src[0]);
+    if (plan == nullptr || plan->extra == nullptr || plan->type != tensor->type || !ggml_are_same_shape(plan, tensor)) {
         return GGML_STATUS_FAILED;
     }
 
-    tensor->op = plan.execution->op;
-    memcpy(tensor->op_params, plan.execution->op_params, sizeof(tensor->op_params));
+    tensor->op = plan->op;
+    memcpy(tensor->op_params, plan->op_params, sizeof(tensor->op_params));
     for (int source = 0; source < GGML_MAX_SRC; ++source) {
-        tensor->src[source] = plan.execution->src[source];
+        tensor->src[source] = plan->src[source];
     }
-    cache->selector_bindings[index] = plan.selectors->extra;
-    tensor->extra = nullptr;
+    tensor->extra = plan->extra;
     return GGML_STATUS_SUCCESS;
 }
 
-static enum ggml_status ggml_backend_meta_moe_cache_materialize_selector(ggml_context * ctx,
-                                                                         ggml_tensor *  tensor,
-                                                                         size_t         index,
-                                                                         void *         userdata) {
-    GGML_UNUSED(ctx);
-    auto * cache = static_cast<ggml_backend_meta_moe_cache *>(userdata);
-    if (cache == nullptr || index >= cache->selector_bindings.size() || tensor->view_src == nullptr ||
-        cache->selector_bindings[index] == nullptr) {
-        return GGML_STATUS_FAILED;
-    }
-    tensor->extra = cache->selector_bindings[index];
-    return GGML_STATUS_SUCCESS;
-}
-
-static ggml_backend_moe_cache_plan ggml_backend_meta_moe_cache_build_plan(ggml_backend_moe_cache_t opaque,
-                                                                          ggml_context *           ctx,
-                                                                          ggml_tensor *            ids) {
+static ggml_tensor * ggml_backend_meta_moe_cache_build_plan(ggml_backend_moe_cache_t opaque,
+                                                            ggml_context *           ctx,
+                                                            ggml_tensor *            ids) {
     auto * cache = reinterpret_cast<ggml_backend_meta_moe_cache *>(opaque);
     if (cache == nullptr || ctx == nullptr || ids == nullptr) {
-        return { nullptr, nullptr };
+        return nullptr;
     }
 
     ggml_backend_moe_cache_plan_layout layout = {};
     if (!ggml_backend_meta_moe_cache_get_plan_layout(opaque, ids, &layout)) {
-        return { nullptr, nullptr };
+        return nullptr;
     }
 
     ggml_tensor * args[2 + GGML_BACKEND_MOE_CACHE_MAX_WEIGHTS] = {};
@@ -269,20 +240,14 @@ static ggml_backend_moe_cache_plan ggml_backend_meta_moe_cache_build_plan(ggml_b
     for (uint32_t weight = 0; weight < cache->n_weights; ++weight) {
         args[2 + weight] = cache->slots[weight];
     }
-    ggml_tensor * execution =
-        ggml_custom_4d(ctx, layout.execution_type, layout.execution_ne[0], layout.execution_ne[1],
-                       layout.execution_ne[2], layout.execution_ne[3], args, 2 + cache->n_weights, nullptr, 1, nullptr);
-    ggml_tensor * selectors =
-        ggml_view_4d(ctx, execution, layout.selectors_ne[0], layout.selectors_ne[1], layout.selectors_ne[2],
-                     layout.selectors_ne[3], layout.selectors_nb[1], layout.selectors_nb[2], layout.selectors_nb[3],
-                     layout.selectors_offset);
+    ggml_tensor * plan = ggml_custom_4d(
+        ctx, layout.type, layout.ne[0], layout.ne[1], layout.ne[2], layout.ne[3], args, 2 + cache->n_weights,
+        nullptr, 1, nullptr);
 
     const ggml_backend_meta_split_state mirrored = { GGML_BACKEND_SPLIT_AXIS_MIRRORED, { 0 }, { 1 }, 1 };
-    ggml_backend_meta_tensor_set_adapter(execution, &cache->execution_adapter, mirrored,
-                                         ggml_backend_meta_moe_cache_materialize_execution, cache);
-    ggml_backend_meta_tensor_set_adapter(selectors, &cache->selector_adapter, mirrored,
-                                         ggml_backend_meta_moe_cache_materialize_selector, cache);
-    return { selectors, execution };
+    ggml_backend_meta_tensor_set_adapter(
+        plan, &cache->plan_adapter, mirrored, ggml_backend_meta_moe_cache_materialize_plan, cache);
+    return plan;
 }
 
 static const ggml_backend_moe_cache_i ggml_backend_meta_moe_cache_interface = {

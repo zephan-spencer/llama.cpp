@@ -11,6 +11,7 @@
 struct ggml_context;
 struct ggml_tensor;
 struct llama_model;
+struct llama_moe_cache_group;
 
 bool llama_moe_cache_is_routed_weight(llm_tensor tensor, const char * suffix);
 void llama_moe_cache_validate_model(
@@ -18,12 +19,22 @@ void llama_moe_cache_validate_model(
     uint32_t n_cache_experts,
     enum llama_moe_cache_policy policy);
 
-struct llama_moe_cache_binding {
-    ggml_tensor * up;
-    ggml_tensor * gate;
-    ggml_tensor * down;
-    ggml_tensor * gate_up;
-    ggml_tensor * ids;
+class llama_moe_cache_layer {
+  public:
+    ggml_tensor * mul_mat(ggml_tensor * weight, ggml_tensor * input) const;
+
+  private:
+    friend class llama_moe_expert_cache;
+
+    llama_moe_cache_layer(ggml_context *          ctx,
+                          llama_moe_cache_group * group,
+                          ggml_tensor *           logical_ids,
+                          ggml_tensor *           plan);
+
+    ggml_context *          ctx;
+    llama_moe_cache_group * group;
+    ggml_tensor *           logical_ids;
+    ggml_tensor *           plan;
 };
 
 class llama_moe_expert_cache {
@@ -34,14 +45,10 @@ class llama_moe_expert_cache {
                            enum llama_moe_cache_policy         policy);
     ~llama_moe_expert_cache();
 
-    llama_moe_cache_binding bind(ggml_context *       ctx,
-                                 ggml_backend_sched_t sched,
-                                 int                  il,
-                                 ggml_tensor *        ids,
-                                 ggml_tensor *        up,
-                                 ggml_tensor *        gate,
-                                 ggml_tensor *        down,
-                                 ggml_tensor *        gate_up);
+    llama_moe_cache_layer build_layer(ggml_context *       ctx,
+                                      ggml_backend_sched_t sched,
+                                      int                  il,
+                                      ggml_tensor *        logical_ids);
 
     void print_info();
 
