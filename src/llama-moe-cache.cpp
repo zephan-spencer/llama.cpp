@@ -31,7 +31,7 @@ void llama_moe_cache_validate_model(
         throw std::runtime_error("MoE expert cache: model has no routed experts");
     }
 
-    if (n_cache < model.hparams.n_expert_used) {
+    if (n_cache < model.hparams.n_expert_used_max()) {
         throw std::runtime_error("MoE expert cache: capacity must cover the experts used per token");
     }
 

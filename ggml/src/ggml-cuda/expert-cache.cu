@@ -3,6 +3,7 @@
 #include "ggml-backend-impl.h"
 #include "ggml-cuda.h"
 #include "ggml-impl.h"
+#include "common.cuh"
 #include "expert-cache-policy.cuh"
 #include "expert-cache-route.cuh"
 
@@ -59,6 +60,30 @@ static const char * ggml_backend_cuda_moe_cache_source_buffer_name(ggml_backend_
     return GGML_CUDA_NAME "_MoE_Cache_Host";
 }
 
+static size_t ggml_backend_cuda_moe_cache_source_buffer_get_alloc_size(
+        ggml_backend_buffer_type_t, const ggml_tensor * tensor) {
+    size_t size = ggml_nbytes(tensor);
+    if (ggml_is_quantized(tensor->type) && tensor->ne[0] % MATRIX_ROW_PADDING != 0) {
+        size += ggml_row_size(tensor->type, MATRIX_ROW_PADDING - tensor->ne[0] % MATRIX_ROW_PADDING);
+    }
+    return size;
+}
+
+static enum ggml_status ggml_backend_cuda_moe_cache_source_buffer_init_tensor(
+        ggml_backend_buffer_t buffer, ggml_tensor * tensor) {
+    if (tensor->view_src != nullptr) {
+        return GGML_STATUS_SUCCESS;
+    }
+    const size_t original_size = ggml_nbytes(tensor);
+    const size_t padded_size = ggml_backend_cuda_moe_cache_source_buffer_get_alloc_size(buffer->buft, tensor);
+    if (padded_size > original_size) {
+        // MMQ may load a complete 256-value K tile past the logical row.
+        // Keep the host source buffer's tail contract identical to CUDA weights.
+        memset(static_cast<char *>(tensor->data) + original_size, 0, padded_size - original_size);
+    }
+    return GGML_STATUS_SUCCESS;
+}
+
 static void ggml_backend_cuda_moe_cache_source_buffer_free(ggml_backend_buffer_t buffer) {
     CUDA_CHECK(cudaFreeHost(buffer->context));
 }
@@ -78,6 +103,7 @@ static ggml_backend_buffer_t ggml_backend_cuda_moe_cache_source_buffer_alloc(
 
     ggml_backend_buffer_t buffer = ggml_backend_cpu_buffer_from_ptr(ptr, size);
     buffer->buft                 = buft;
+    buffer->iface.init_tensor    = ggml_backend_cuda_moe_cache_source_buffer_init_tensor;
     buffer->iface.free_buffer    = ggml_backend_cuda_moe_cache_source_buffer_free;
     return buffer;
 }
@@ -100,7 +126,7 @@ static ggml_backend_buffer_type_t ggml_backend_cuda_moe_cache_source_buffer_type
                 /* .alloc_buffer   = */ ggml_backend_cuda_moe_cache_source_buffer_alloc,
                 /* .get_alignment  = */ ggml_backend_cpu_buffer_type()->iface.get_alignment,
                 /* .get_max_size   = */ nullptr,
-                /* .get_alloc_size = */ ggml_backend_cpu_buffer_type()->iface.get_alloc_size,
+                /* .get_alloc_size = */ ggml_backend_cuda_moe_cache_source_buffer_get_alloc_size,
                 /* .is_host        = */ ggml_backend_cpu_buffer_type()->iface.is_host,
             },
             /* .device  = */ device,
