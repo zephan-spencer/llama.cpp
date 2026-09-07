@@ -131,9 +131,6 @@ flake.lock
 /winogrande-debiased-eval.csv
 /wikitext-2-raw/
 
-# Benchmark output
-/benchmark-results/
-
 # Test models for lora adapters
 
 /lora-tests
