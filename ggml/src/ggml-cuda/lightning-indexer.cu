@@ -3,6 +3,104 @@
 #include "fattn-common.cuh"
 #include "convert.cuh"
 
+#if defined(GGML_USE_HIP)
+#include "mma.cuh"
+
+// Reuse a dequantized key tile across queries and all 64 indexer heads.
+// Keep head scores in LDS: ReLU must follow the complete dot product.
+template<int NQ, int NK>
+static __global__ void lightning_indexer_kernel_rdna4(
+        const float * Q, const char * K, const float * W, const half * M, float * dst,
+        int n_batch, int n_kv, size_t nb1, size_t nb3,
+        size_t nbq1, size_t nbq2, size_t nbq3, size_t nbk2, size_t nbk3,
+        size_t nbw1, size_t nbw3, size_t nbm1, size_t nbm3, int64_t nem3) {
+#if defined(RDNA4)
+    using namespace ggml_cuda_mma;
+    const int lane = threadIdx.x;
+    const int warp = threadIdx.y;
+    const int tid = 32*warp + lane;
+    const int stream = blockIdx.z;
+    const int first_q = blockIdx.y*NQ;
+    const int first_k = blockIdx.x*NK;
+    __shared__ half2 keys[NK][64];
+    __shared__ half2 queries[NQ][16][64];
+    __shared__ float weights[NQ][16];
+    __shared__ float products[NQ][16][NK];
+    float scores[(NQ*NK + 127)/128] = {};
+
+    constexpr dequantize_V_t dequantize_k = get_dequantize_V<GGML_TYPE_Q8_0, half, 4>();
+    for (int i = tid; i < NK*32; i += 128) {
+        const int key = i/32;
+        const int col = i%32;
+        if (first_k + key < n_kv) {
+            dequantize_k(K + stream*nbk3 + (first_k + key)*nbk2, &keys[key][2*col], 4*col);
+        } else {
+            keys[key][2*col] = keys[key][2*col + 1] = __float2half2_rn(0.0f);
+        }
+    }
+    for (int head = 0; head < 64; head += 16) {
+        for (int i = tid; i < NQ*16*64; i += 128) {
+            const int col = i%64;
+            const int h = (i/64)%16;
+            const int query = i/(64*16);
+            half2 value = __float2half2_rn(0.0f);
+            if (first_q + query < n_batch) {
+                const float * row = (const float *) ((const char *) Q + stream*nbq3 +
+                        (first_q + query)*nbq2 + (head + h)*nbq1);
+                value = __floats2half2_rn(row[2*col], row[2*col + 1]);
+            }
+            queries[query][h][col] = value;
+        }
+        for (int i = tid; i < NQ*16; i += 128) {
+            const int query = i/16;
+            weights[query][i%16] = first_q + query < n_batch ?
+                ((const float *) ((const char *) W + stream*nbw3 + (first_q + query)*nbw1))[head + i%16] : 0.0f;
+        }
+        __syncthreads();
+        for (int job = warp; job < NQ*(NK/16); job += 4) {
+            const int query = job/(NK/16);
+            const int key = (job%(NK/16))*16;
+            tile<16, 16, float> acc;
+            for (int col = 0; col < 64; col += 8) {
+                tile<16, 8, half2> a, b;
+                load_generic(a, &queries[query][0][col], 64);
+                load_generic(b, &keys[key][col], 64);
+                mma(acc, a, b);
+            }
+            for (int i = 0; i < acc.ne; ++i) {
+                // RDNA4 accumulators use the transposed operand layout.
+                products[query][acc.get_j(i)][key + acc.get_i(i)] = acc.x[i];
+            }
+        }
+        __syncthreads();
+        for (int i = tid; i < NQ*NK; i += 128) {
+            const int query = i/NK;
+            const int key = i%NK;
+            float sum = scores[i/128];
+            for (int h = 0; h < 16; ++h) {
+                sum += fmaxf(products[query][h][key], 0.0f)*weights[query][h];
+            }
+            scores[i/128] = sum;
+        }
+        __syncthreads();
+    }
+    for (int i = tid; i < NQ*NK; i += 128) {
+        const int query = first_q + i/NK;
+        const int key = first_k + i%NK;
+        if (query < n_batch && key < n_kv) {
+            const half * mask = (const half *) ((const char *) M + (stream%nem3)*nbm3 + query*nbm1);
+            float * out = (float *) ((char *) dst + stream*nb3 + query*nb1);
+            out[key] = scores[i/128] + __half2float(mask[key]);
+        }
+    }
+#else
+    GGML_UNUSED_VARS(Q, K, W, M, dst, n_batch, n_kv, nb1, nb3,
+        nbq1, nbq2, nbq3, nbk2, nbk3, nbw1, nbw3, nbm1, nbm3, nem3);
+    NO_DEVICE_CODE;
+#endif
+}
+#endif
+
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 #if defined(TURING_MMA_AVAILABLE)
 
@@ -445,6 +543,19 @@ void ggml_cuda_lightning_indexer(ggml_backend_cuda_context & ctx, ggml_tensor * 
 
     const int device = ggml_cuda_get_device();
     const int cc     = ggml_cuda_info().devices[device].cc;
+
+#if defined(GGML_USE_HIP)
+    if (GGML_CUDA_CC_IS_RDNA4(cc) && n_embd == 128 && n_head == 64 &&
+            k->type == GGML_TYPE_Q8_0 && n_batch > 16) {
+        constexpr int NQ = 2;
+        constexpr int NK = 64;
+        lightning_indexer_kernel_rdna4<NQ, NK>
+            <<<dim3((n_kv + NK - 1)/NK, (n_batch + NQ - 1)/NQ, n_stream), dim3(32, 4), 0, ctx.stream()>>>(
+                q_d, k_d, w_d, m_d, dst_d, n_batch, n_kv, nb1, nb3,
+                nbq1, nbq2, nbq3, nbk2, nbk3, nbw1, nbw3, nbm1, nbm3, nem3);
+        return;
+    }
+#endif
 
     if (n_embd == 128 && n_head == 64) {
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
