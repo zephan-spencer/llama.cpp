@@ -7,7 +7,7 @@
 #include "mma.cuh"
 
 // Reuse a dequantized key tile across queries and all 64 indexer heads.
-// Keep head scores in LDS: ReLU must follow the complete dot product.
+// Reduce heads within each wave after completing the dot product.
 template<int NQ, int NK>
 static __global__ void lightning_indexer_kernel_rdna4(
         const float * Q, const char * K, const float * W, const half * M, float * dst,
@@ -25,8 +25,7 @@ static __global__ void lightning_indexer_kernel_rdna4(
     __shared__ half2 keys[NK][64];
     __shared__ half2 queries[NQ][16][64];
     __shared__ float weights[NQ][16];
-    __shared__ float products[NQ][16][NK];
-    float scores[(NQ*NK + 127)/128] = {};
+    float scores[(NQ*(NK/16) + 3)/4] = {};
 
     constexpr dequantize_V_t dequantize_k = get_dequantize_V<GGML_TYPE_Q8_0, half, 4>();
     for (int i = tid; i < NK*32; i += 128) {
@@ -67,30 +66,28 @@ static __global__ void lightning_indexer_kernel_rdna4(
                 load_generic(b, &keys[key][col], 64);
                 mma(acc, a, b);
             }
+            // The accumulator holds eight heads for key lane%16; the other
+            // half-wave holds the remaining eight heads for the same key.
+            float sum = 0.0f;
+#pragma unroll
             for (int i = 0; i < acc.ne; ++i) {
-                // RDNA4 accumulators use the transposed operand layout.
-                products[query][acc.get_j(i)][key + acc.get_i(i)] = acc.x[i];
+                sum += fmaxf(acc.x[i], 0.0f)*weights[query][acc.get_j(i)];
             }
+            sum += __shfl_xor_sync(0xffffffff, sum, 16, 32);
+            scores[job/4] += sum;
         }
-        __syncthreads();
-        for (int i = tid; i < NQ*NK; i += 128) {
-            const int query = i/NK;
-            const int key = i%NK;
-            float sum = scores[i/128];
-            for (int h = 0; h < 16; ++h) {
-                sum += fmaxf(products[query][h][key], 0.0f)*weights[query][h];
-            }
-            scores[i/128] = sum;
-        }
+        // All waves must finish reading Q and weights before the next head group.
         __syncthreads();
     }
-    for (int i = tid; i < NQ*NK; i += 128) {
-        const int query = first_q + i/NK;
-        const int key = first_k + i%NK;
-        if (query < n_batch && key < n_kv) {
-            const half * mask = (const half *) ((const char *) M + (stream%nem3)*nbm3 + query*nbm1);
-            float * out = (float *) ((char *) dst + stream*nb3 + query*nb1);
-            out[key] = scores[i/128] + __half2float(mask[key]);
+    if (lane < 16) {
+        for (int job = warp; job < NQ*(NK/16); job += 4) {
+            const int query = first_q + job/(NK/16);
+            const int key = first_k + (job%(NK/16))*16 + lane;
+            if (query < n_batch && key < n_kv) {
+                const half * mask = (const half *) ((const char *) M + (stream%nem3)*nbm3 + query*nbm1);
+                float * out = (float *) ((char *) dst + stream*nb3 + query*nb1);
+                out[key] = scores[job/4] + __half2float(mask[key]);
+            }
         }
     }
 #else
