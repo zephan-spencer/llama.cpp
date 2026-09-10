@@ -107,7 +107,7 @@ void ggml_cuda_flash_attn_ext_compact_mask(
 }
 
 bool ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
-#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+#if defined(GGML_USE_MUSA)
     GGML_UNUSED_VARS(ctx, dst);
     return false;
 #else
@@ -122,11 +122,18 @@ bool ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(ggml_backend_cuda_context
     memcpy(&logit_softcap, (const float *) dst->op_params + 2, sizeof(float));
 
     const int32_t n_kv_max = ggml_get_op_params_i32(dst, 4);
-    return GGML_CUDA_CC_IS_NVIDIA(cc) && turing_mma_available(cc) &&
+#ifdef GGML_USE_HIP
+    const bool supported = GGML_CUDA_CC_IS_RDNA4(cc) && Q->ne[0] == 512 &&
+        Q->ne[1] > 16 && (Q->ne[2] / K->ne[2]) % 16 == 0 &&
+        (K->type == GGML_TYPE_F16 || K->type == GGML_TYPE_Q8_0) && dst->src[2]->type == K->type;
+#else
+    const bool supported = GGML_CUDA_CC_IS_NVIDIA(cc) && turing_mma_available(cc);
+#endif
+    return supported &&
         mask != nullptr && n_kv_max > 0 && max_bias == 0.0f && logit_softcap == 0.0f &&
         mask->ne[0] == K->ne[1] && mask->ne[1] >= Q->ne[1] && mask->ne[2] == 1 &&
         K->ne[1] >= std::max<int64_t>(4096, 2LL*n_kv_max);
-#endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+#endif // !defined(GGML_USE_MUSA)
 }
 
 template <int DKQ, int DV, int ncols2>
@@ -310,6 +317,17 @@ static void ggml_cuda_flash_attn_ext_mma_f16(ggml_backend_cuda_context & ctx, gg
             break;
         case 512:
             GGML_ASSERT(V->ne[0] == 512);
+#ifdef GGML_USE_HIP
+            if (ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(ctx, dst)) {
+                ggml_cuda_flash_attn_ext_mma_f16_case<512, 512, 1, 16>(ctx, dst);
+                break;
+            }
+            if (GGML_CUDA_CC_IS_RDNA4(ggml_cuda_info().devices[ctx.device].cc)) {
+                // 32 columns leave space for Q and KV in LDS at head dimension 512.
+                ggml_cuda_flash_attn_ext_mma_f16_case<512, 512, 4, 8>(ctx, dst);
+                break;
+            }
+#endif
             ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2<512, 512>(ctx, dst);
             break;
         case 576: {
@@ -628,6 +646,13 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
         if (Q->ne[1] * gqa_ratio_eff <= 16) {
             return BEST_FATTN_KERNEL_TILE; // On Volta tensor cores are only faster for sufficiently large matrices.
         }
+        return BEST_FATTN_KERNEL_MMA_F16;
+    }
+
+    // RDNA4 can fill a WMMA tile across grouped heads at large head dimensions.
+    if (GGML_CUDA_CC_IS_RDNA4(cc) && Q->ne[0] == 512 && Q->ne[1] > 16 &&
+            gqa_opt_applies && gqa_ratio % 16 == 0 &&
+            (K->type == GGML_TYPE_F16 || K->type == GGML_TYPE_Q8_0) && V->type == K->type) {
         return BEST_FATTN_KERNEL_MMA_F16;
     }
 
